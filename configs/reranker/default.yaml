@@ -1,0 +1,56 @@
+seed: 888
+num_workers: 32
+run_name: reranker-v0
+
+data:
+  dataset_names:
+    - Hieuman/reddit_bm25
+  languages: [en]
+  global_batch_size: 64
+  max_seq_length: 1024
+  num_train_examples: 50000
+  num_pos_per_query: 1
+  num_neg_per_query: 1
+  instruction: null
+
+model:
+  model_name_or_path: Qwen/Qwen3-4B-Base
+  attn_implementation: flash_attention_2
+  quantization: false
+  lora:
+    use_lora: false
+    r: 16
+    alpha: 32
+    dropout: 0.1
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    name: default
+
+training:
+  output_dir: outputs/reranker-v0
+  devices: 4
+  precision: bf16-mixed
+  epochs: 5
+  lr: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 100
+  grad_clip: 1.0
+  gradient_accumulation_steps: 8
+  checkpoint_interval: 2000
+  logger:
+    type: wandb
+    project: authorship-reranker
+
+evaluation:
+  genres:
+    - HRS3.1
+    - HRS3.2
+    - HRS3.3
+    - HRS3.4
+    - HRS3.5
+    - en_cross_genre_short
+  batch_size: 32
+  max_length: 512
+  top_k: 16
+  reranker_weight: 0.5
+  embedder_config_dir: null
+  embedder_checkpoint_path: null

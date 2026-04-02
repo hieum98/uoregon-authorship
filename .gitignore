@@ -1,0 +1,6 @@
+*__pycache__*
+wandb
+.github
+outputs
+checkpoint
+eval_results

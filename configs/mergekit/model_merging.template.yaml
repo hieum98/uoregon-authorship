@@ -1,0 +1,11 @@
+models:
+  - model: /path/to/model_a.safetensors
+    parameters:
+      weight: 0.5
+  - model: /path/to/model_b.safetensors
+    parameters:
+      weight: 0.5
+merge_method: linear
+parameters:
+  normalize: true
+dtype: float32

@@ -1,0 +1,114 @@
+seed: 888
+num_workers: 32
+run_name: embedder-8B-v2
+
+data:
+  dataset_names:
+    - Hieuman/ru_KP
+    - Hieuman/weibo_full
+    - Hieuman/hiatus-imdb
+    - Hieuman/yt_comments
+    - Hieuman/ru_STX
+    - Hieuman/MUD
+    - Hieuman/reddit_dump
+    - Hieuman/dianping_review
+    - Hieuman/wiki_en_small
+    - Hieuman/HNI
+    - Hieuman/wiki_ru
+    - Hieuman/nyt_comments
+    - Hieuman/movie_reviews
+    - Hieuman/jd_reviews
+    - Hieuman/blog_authorship
+    - Hieuman/stihi_ru
+    - Hieuman/goodreads
+    - Hieuman/exorde
+    - Hieuman/douban_reviews
+    - Hieuman/yelp_review
+    - Hieuman/proza_ru
+    - Hieuman/amazon_reviews
+    - Hieuman/u-sticker
+    - Hieuman/ru_reddit_dump
+    - Hieuman/ru_telegram
+    - Hieuman/STX
+  languages: 
+    - en
+    - zh
+    - ar
+    - ru
+    - es
+    - de
+    - fr
+  global_batch_size: 64
+  max_seq_length: 256
+  num_train_examples: 10000
+  num_hard_negatives: 126
+  eval_batch_size: 32
+
+model:
+  model_name_or_path: Qwen/Qwen3-8B-Base
+  pooling: mean
+  is_bidirectional: true
+  attn_implementation: flash_attention_2
+  quantization: false
+  dropout: 0.1
+  lora:
+    use_lora: false
+    r: 16
+    alpha: 32
+    dropout: 0.1
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    name: default
+
+training:
+  output_dir: outputs/embedder-8B-v2
+  devices: 4
+  precision: bf16-true
+  epochs: 2
+  lr: 6e-6
+  weight_decay: 0.01
+  warmup_steps: 300
+  min_lr_rate: 1.5e-7
+  grad_clip: 1.0
+  gc_chunk_size: 16
+  checkpoint_interval: 1000
+  resume_checkpoint: outputs/merged-8B.v3-eer-wins
+  only_reload_model: true
+  logger:
+    type: wandb
+    project: authorship-embedder
+
+loss:
+  temperature: 0.05
+  use_miner: true
+  normalize: true
+
+evaluation:
+  genres:
+    - HRS2.1
+    - HRS2.2
+    - HRS2.3
+    - HRS2.4
+    - HRS2.5
+    - en_cross_genre_medium
+    - HRS2.101
+    - HRS2.102
+    - HRS2.103
+    - HRS2.104
+    - HRS2.105
+    - ru_cross_genre_long
+    - ru_cross_genre_medium
+    - HRS3.1
+    - HRS3.2
+    - HRS3.3
+    - HRS3.4
+    - HRS3.5
+    - en_cross_genre_short
+    - HRS3.301
+    - HRS3.302
+    - HRS3.303
+    - HRS3.304
+    - HRS3.305
+    - zh_cross_genre_medium
+    - zh_cross_genre_short
+  batch_size: 32
+  max_length: 512
