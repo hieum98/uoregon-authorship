@@ -16,11 +16,11 @@ Usage:
         --mode embedder --config_dir outputs/embedder-v0 \\
         --checkpoint_path outputs/embedder-v0/checkpoint_0_1000.ckpt
 
-    # Watcher (embedder, logs to same wandb run as training)
+    # Watcher (embedder, log to a dedicated new wandb eval run)
     python -m authorship.evaluation.eval_hrs watch \\
         --mode embedder --config_dir outputs/embedder-v0 \\
         --checkpoint_dir outputs/embedder-v0 \\
-        --wandb_run_id <run_id> --wandb_project authorship-embedder
+        --wandb_project authorship-embedder --wandb_log_to_new_run
 
     # Single checkpoint (reranker, full system)
     python -m authorship.evaluation.eval_hrs eval \\
@@ -580,7 +580,11 @@ def _add_common_args(parser: argparse.ArgumentParser):
                         help="HRS genres to evaluate (default: read from config or HRS3 en+zh)")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--max_length", type=int, default=512)
-    parser.add_argument("--wandb_run_id", default=None, help="Resume this wandb run for logging")
+    parser.add_argument(
+        "--wandb_run_id",
+        default=None,
+        help="Existing wandb run id to resume for logging (ignored with --wandb_log_to_new_run)",
+    )
     parser.add_argument("--wandb_project", default=None, help="wandb project name")
     parser.add_argument("--wandb_entity", default=None, help="wandb entity/user or org")
     parser.add_argument("--wandb_run_name", default=None, help="Set wandb run name (useful for eval runs)")

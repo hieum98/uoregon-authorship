@@ -63,7 +63,9 @@ class PairwiseAuthorshipDataset(Dataset):
         self.data = data
 
     def _get_positives(self, example: dict) -> List[dict]:
-        pos_ids = example.get("sameAuthor_docIDs", [])
+        # Prefer embedder-mined hard positives (lowest cosine sim); fall back to
+        # random same-author sampling for datasets without the new column.
+        pos_ids = example.get("hard_positive_docIDs") or example.get("sameAuthor_docIDs", [])
         if not pos_ids:
             fb = copy.deepcopy(example)
             words = fb["fullText"].split()
@@ -73,7 +75,9 @@ class PairwiseAuthorshipDataset(Dataset):
 
     def _get_negatives(self, example: dict) -> List[dict]:
         author_id = example["authorIDs"]
-        neg_ids = example.get("BM25_retrieved_docIDs", [])
+        # Prefer embedder-mined hard negatives (highest cosine sim); fall back to
+        # BM25-mined negatives for datasets without the new column.
+        neg_ids = example.get("hard_negative_docIDs") or example.get("BM25_retrieved_docIDs", [])
         if neg_ids:
             cands = self.candidate_data.select(neg_ids[: self.num_neg * 3]).to_list()
             negs = [c for c in cands if c["authorIDs"] != author_id]
