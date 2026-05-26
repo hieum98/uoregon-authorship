@@ -23,12 +23,16 @@ def tokenize_example(
 # ---- Reranker prompt formatting ----
 
 SYSTEM_PROMPT = (
-    "Judge whether the Document is written by the same author as the Query. "
-    'Note that the answer can only be "yes" or "no".'
+    "Judge whether the Document is written by the same author as the Query based solely "
+    "on writing style — not topic or content. Focus on stylistic fingerprints such as "
+    "vocabulary choices, sentence structure, punctuation habits, tone, and rhetorical "
+    'patterns. Note that the answer can only be "yes" or "no".'
 )
 
 DEFAULT_INSTRUCTION = (
-    "Given a query text, determine if the provided document was written by the same author"
+    "Given a query text, determine if the provided document shares the same authorial "
+    "style — ignore content similarity and focus exclusively on stylistic fingerprints "
+    "such as word choice, sentence rhythm, punctuation, and tone"
 )
 
 
@@ -74,13 +78,21 @@ def tokenize_pair(
     max_length: int = 1024,
     instruction: Optional[str] = None,
 ) -> dict:
-    """Tokenize a (query, doc) pair for the reranker using prefix/suffix pattern."""
+    """Tokenize a (query, doc) pair, allocating the token budget equally between query and doc."""
     prefix_tokens, suffix_tokens = get_prefix_suffix_tokens(tokenizer)
-    user_content = format_authorship_prompt(query_text, doc_text, instruction)
+    instruct = instruction or DEFAULT_INSTRUCTION
 
-    content_max = max_length - len(prefix_tokens) - len(suffix_tokens)
-    content_tokens = tokenizer.encode(
-        user_content, add_special_tokens=False,
-        truncation=True, max_length=content_max,
+    header = tokenizer.encode(
+        f"<Instruct>: {instruct}\n<Query>: ", add_special_tokens=False
     )
-    return {"input_ids": prefix_tokens + content_tokens + suffix_tokens}
+    sep = tokenizer.encode("\n<Document>: ", add_special_tokens=False)
+
+    overhead = len(prefix_tokens) + len(suffix_tokens) + len(header) + len(sep)
+    half = max(1, (max_length - overhead) // 2)
+
+    q_tokens = tokenizer.encode(query_text, add_special_tokens=False,
+                                truncation=True, max_length=half)
+    d_tokens = tokenizer.encode(doc_text, add_special_tokens=False,
+                                truncation=True, max_length=half)
+
+    return {"input_ids": prefix_tokens + header + q_tokens + sep + d_tokens + suffix_tokens}

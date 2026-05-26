@@ -171,7 +171,6 @@ def main():
         ds = mine_hard_negatives(ds, language=lang, top_k=args.top_k, batch_size=args.batch_size, use_stopwords=args.use_stopwords)
         result[lang] = ds
         print(f"[{lang}] Mined negatives for {len(ds)} documents")
-        breakpoint()
 
     combined = datasets.DatasetDict(result)
     combined.save_to_disk(args.output_dir)

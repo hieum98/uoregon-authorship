@@ -36,15 +36,20 @@ def compute_reranker_loss(
     labels: torch.Tensor,
     label_smoothing: float = 0.0,
 ) -> torch.Tensor:
-    """BCE loss on P(yes) for reranker training."""
-    stacked = torch.stack([false_logits, true_logits], dim=1)
-    log_probs = torch.nn.functional.log_softmax(stacked, dim=1)
-    probs_yes = log_probs[:, 1].exp()
+    """BCE loss on P(yes) for reranker training.
+
+    Uses binary_cross_entropy_with_logits on (true - false) logit difference,
+    which is equivalent to softmax-over-2 + BCE but numerically stable for
+    extreme logit values via the log-sum-exp trick.
+    """
+    logit_diff = true_logits - false_logits  # log-odds = log P(yes)/P(no)
 
     if label_smoothing > 0:
         labels = labels * (1 - label_smoothing) + 0.5 * label_smoothing
 
-    return torch.nn.functional.binary_cross_entropy(probs_yes, labels)
+    return torch.nn.functional.binary_cross_entropy_with_logits(
+        logit_diff, labels.to(logit_diff.device)
+    )
 
 
 def compute_reranker_metrics(
@@ -67,12 +72,17 @@ def compute_reranker_metrics(
 
     pos_mask = labels == 1
     neg_mask = labels == 0
+    avg_p_yes_pos = probs_yes[pos_mask].mean().item() if pos_mask.any() else 0
+    avg_p_yes_neg = probs_yes[neg_mask].mean().item() if neg_mask.any() else 0
 
     return {
         "accuracy": (preds == labels).float().mean().item(),
         "precision": precision.item(),
         "recall": recall.item(),
         "f1": f1.item(),
-        "avg_p_yes_pos": probs_yes[pos_mask].mean().item() if pos_mask.any() else 0,
-        "avg_p_yes_neg": probs_yes[neg_mask].mean().item() if neg_mask.any() else 0,
+        "label_pos_rate": labels.float().mean().item(),
+        "pred_yes_rate": preds.float().mean().item(),
+        "avg_p_yes_pos": avg_p_yes_pos,
+        "avg_p_yes_neg": avg_p_yes_neg,
+        "p_yes_gap": avg_p_yes_pos - avg_p_yes_neg,
     }

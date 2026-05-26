@@ -47,8 +47,10 @@ See ``scripts/mine_hard_pairs.sh`` for a convenience wrapper.
 """
 
 import argparse
+import math
 import os
 import pickle
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -80,7 +82,12 @@ def init_dist() -> Tuple[int, int, int]:
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+        if world_size > 1:
+            dist.init_process_group(
+                backend="nccl",
+                device_id=torch.device(f"cuda:{local_rank}"),
+                timeout=timedelta(hours=8),
+            )
         return rank, world_size, local_rank
     return 0, 1, 0
 
@@ -296,22 +303,28 @@ def build_faiss_index(
         return
 
     all_emb = np.memmap(merged_emb_path, dtype="float16", mode="r", shape=(N, D))
-    quantizer = faiss.IndexFlatIP(D)
 
-    if N > 1_000_000:
-        M = min(64, D // 4)  # PQ subvectors — 64 bytes/vec for D≥256
-        index = faiss.IndexIVFPQ(quantizer, D, nlist, M, 8)
-        print(f"[Rank 0] Using IndexIVFPQ (N={N:,}, nlist={nlist}, M={M})")
+    if N <= 500_000:
+        # Brute-force exact search — no training, perfect recall, fast for <500K vecs.
+        index = faiss.IndexFlatIP(D)
+        print(f"[Rank 0] Using IndexFlatIP (N={N:,}, exact search)")
     else:
-        index = faiss.IndexIVFFlat(quantizer, D, nlist, faiss.METRIC_INNER_PRODUCT)
-        print(f"[Rank 0] Using IndexIVFFlat (N={N:,}, nlist={nlist})")
-
-    n_train = min(max(nlist * 39, 100_000), N)
-    sample_idx = np.random.choice(N, n_train, replace=False)
-    train_data = np.asarray(all_emb[sample_idx]).astype(np.float32)
-    print(f"[Rank 0] Training FAISS index on {n_train:,} vectors …")
-    index.train(train_data)
-    del train_data
+        # Recommended nlist ≈ sqrt(N); hard cap N//39 (FAISS training requirement).
+        nlist = max(1, min(nlist, int(math.sqrt(N)), N // 39))
+        quantizer = faiss.IndexFlatIP(D)
+        if N > 1_000_000:
+            M = min(64, D // 4)
+            index = faiss.IndexIVFPQ(quantizer, D, nlist, M, 8, faiss.METRIC_INNER_PRODUCT)
+            print(f"[Rank 0] Using IndexIVFPQ (N={N:,}, nlist={nlist}, M={M})")
+        else:
+            index = faiss.IndexIVFFlat(quantizer, D, nlist, faiss.METRIC_INNER_PRODUCT)
+            print(f"[Rank 0] Using IndexIVFFlat (N={N:,}, nlist={nlist})")
+        n_train = min(max(nlist * 39, 100_000), N)
+        sample_idx = np.random.choice(N, n_train, replace=False)
+        train_data = np.asarray(all_emb[sample_idx]).astype(np.float32)
+        print(f"[Rank 0] Training FAISS index on {n_train:,} vectors …")
+        index.train(train_data)
+        del train_data
 
     CHUNK = 100_000
     for start in tqdm(range(0, N, CHUNK), desc="[Rank 0] Building index"):
@@ -325,6 +338,65 @@ def build_faiss_index(
 # ---------------------------------------------------------------------------
 # Phase 4 — Mine hard pairs
 # ---------------------------------------------------------------------------
+
+def _compute_hard_positives_by_author(
+    rank_doc_ids: List[int],
+    all_embs: np.ndarray,
+    author_ids: List[str],
+    same_author_ids: List[List[int]],
+    top_k_pos: int,
+    rank: int,
+) -> Dict[int, List[int]]:
+    """Compute hard positives for all rank docs grouped by author.
+
+    For each unique author whose docs appear in ``rank_doc_ids``, load all
+    same-author corpus embeddings once and compute pairwise cosine similarities
+    in a single matmul, then extract ``top_k_pos`` hardest positives per doc.
+
+    This replaces O(N) individual ``(1, D) @ (P, D).T`` matmuls with
+    O(N_authors) batch matmuls, eliminating repeated random array accesses.
+    """
+    from collections import defaultdict
+
+    hard_pos_dict: Dict[int, List[int]] = {}
+
+    # Group rank docs by author and collect their corpus doc sets
+    author_to_rank_gids: Dict[str, List[int]] = defaultdict(list)
+    for gid in rank_doc_ids:
+        author_to_rank_gids[author_ids[gid]].append(gid)
+
+    for aid, rank_gids in tqdm(
+        author_to_rank_gids.items(),
+        desc=f"[Rank {rank}] Hard positives",
+        disable=not is_main(),
+    ):
+        # same_author_ids[gid] is consistent for all gids of the same author
+        corpus_doc_ids = same_author_ids[rank_gids[0]]
+        if not corpus_doc_ids:
+            for gid in rank_gids:
+                hard_pos_dict[gid] = []
+            continue
+
+        corpus_doc_ids_arr = np.asarray(corpus_doc_ids)
+        embs = all_embs[corpus_doc_ids_arr].astype(np.float32)  # (A, D)
+        sims_matrix = embs @ embs.T  # (A, A) — valid; embeddings are L2-normalised
+
+        doc_to_idx = {int(did): i for i, did in enumerate(corpus_doc_ids_arr)}
+        for gid in rank_gids:
+            idx = doc_to_idx.get(gid, -1)
+            if idx < 0:
+                hard_pos_dict[gid] = []
+                continue
+            sims = sims_matrix[idx]
+            # Ascending: lowest cosine sim = hardest positives; self-sim (1.0) ends up last
+            order = np.argsort(sims)
+            # Skip self (self-sim == 1.0 is at the tail of ascending order, so just slice)
+            hard_pos_dict[gid] = [
+                int(corpus_doc_ids_arr[j]) for j in order if corpus_doc_ids_arr[j] != gid
+            ][:top_k_pos]
+
+    return hard_pos_dict
+
 
 def mine_pairs_for_shard(
     rank_doc_ids: List[int],
@@ -349,7 +421,7 @@ def mine_pairs_for_shard(
 
     Args:
         rank_doc_ids: Global docIDs handled by this rank.
-        all_embeddings: Float16 memmap ``(N, D)`` indexed by global docID.
+        all_embeddings: In-RAM float16 array ``(N, D)`` indexed by global docID.
         author_ids: ``author_ids[docID]`` → author string.
         same_author_ids: ``same_author_ids[docID]`` → list of same-author docIDs.
         index: Loaded FAISS index (``index.nprobe`` should be set by caller).
@@ -363,44 +435,32 @@ def mine_pairs_for_shard(
     Returns:
         ``(hard_neg_dict, hard_pos_dict)`` keyed by global docID.
     """
+    # ── Hard positives: one pass grouped by author (avoids per-doc random access)
+    hard_pos_dict = _compute_hard_positives_by_author(
+        rank_doc_ids, all_embeddings, author_ids, same_author_ids, top_k_pos, rank
+    )
+
+    # Pre-build numpy author array for vectorised same-author filtering
+    author_arr = np.array(author_ids)  # object dtype; enables vectorised != comparison
+
     hard_neg_dict: Dict[int, List[int]] = {}
-    hard_pos_dict: Dict[int, List[int]] = {}
+    fetch_k = min(top_k_neg * neg_buffer, index.ntotal)
 
     for start in tqdm(
         range(0, len(rank_doc_ids), batch_size),
-        desc=f"[Rank {rank}] Mining",
+        desc=f"[Rank {rank}] Mining negatives",
         disable=not is_main(),
     ):
         batch_ids = rank_doc_ids[start : start + batch_size]
-        query_embs = np.asarray(all_embeddings[batch_ids]).astype(np.float32)  # (B, D)
+        query_embs = all_embeddings[batch_ids].astype(np.float32)  # (B, D)
 
         # ── Hard negatives (FAISS ANN) ───────────────────────────────────────
-        fetch_k = min(top_k_neg * neg_buffer, index.ntotal)
         _, faiss_hits = index.search(query_embs, fetch_k)  # (B, fetch_k)
 
         for i, gid in enumerate(batch_ids):
-            author = author_ids[gid]
-            cross_author = [
-                int(h)
-                for h in faiss_hits[i]
-                if h >= 0 and h != gid and author_ids[h] != author
-            ]
-            hard_neg_dict[gid] = cross_author[:top_k_neg]
-
-        # ── Hard positives (exact cosine sim over sameAuthor_docIDs) ─────────
-        for i, gid in enumerate(batch_ids):
-            pos_ids = same_author_ids[gid]
-            if not pos_ids:
-                hard_pos_dict[gid] = []
-                continue
-
-            pos_embs = np.asarray(all_embeddings[pos_ids]).astype(np.float32)  # (P, D)
-            q_emb = query_embs[i : i + 1]  # (1, D)
-            sims = (q_emb @ pos_embs.T)[0]  # (P,) — valid because both are L2-normalised
-
-            # Ascending: lowest cosine sim first = hardest positives
-            order = np.argsort(sims)
-            hard_pos_dict[gid] = [int(pos_ids[j]) for j in order[:top_k_pos]]
+            hits = faiss_hits[i]  # (fetch_k,) int64
+            valid = (hits >= 0) & (hits != gid) & (author_arr[hits] != author_ids[gid])
+            hard_neg_dict[gid] = hits[valid][:top_k_neg].tolist()
 
     return hard_neg_dict, hard_pos_dict
 
@@ -423,6 +483,8 @@ def process_language_split(
     rank: int,
     world_size: int,
     dataset_key: str,
+    neg_buffer: int = 4,
+    mine_batch_size: int = 512,
 ) -> datasets.Dataset:
     """Run the full mining pipeline for one language split.
 
@@ -436,7 +498,7 @@ def process_language_split(
         embedding_dir: Root cache directory.
         top_k_neg: Hard negatives per query.
         top_k_pos: Hard positives per query.
-        batch_size: Encoding/mining batch size.
+        batch_size: Encoding batch size (texts per GPU forward pass).
         max_length: Max token length for encoding.
         nlist: FAISS IVF nlist.
         nprobe: FAISS search probes.
@@ -495,9 +557,14 @@ def process_language_split(
     D = peek.shape[1]
     del peek
 
-    all_emb = np.memmap(merged_emb_path, dtype="float16", mode="r", shape=(N, D))
+    _mmap = np.memmap(merged_emb_path, dtype="float16", mode="r", shape=(N, D))
+    mem_gb = N * D * 2 / 1e9
+    print(f"[Rank {rank}] Loading {N:,}×{D} embeddings into RAM ({mem_gb:.1f} GB) …", flush=True)
+    all_emb = np.asarray(_mmap)  # single sequential read → eliminates random GPFS I/O
+    del _mmap
     index = faiss.read_index(index_path)
-    index.nprobe = nprobe
+    if hasattr(index, "nprobe"):
+        index.nprobe = nprobe
 
     author_ids: List[str] = dataset["authorIDs"]
     same_author_ids: List[List[int]] = dataset["sameAuthor_docIDs"]
@@ -518,7 +585,8 @@ def process_language_split(
             top_k_neg=top_k_neg,
             top_k_pos=top_k_pos,
             rank=rank,
-            batch_size=batch_size,
+            neg_buffer=neg_buffer,
+            batch_size=mine_batch_size,
         )
         with open(hard_neg_path, "wb") as fh:
             pickle.dump(hard_neg_dict, fh, protocol=4)
@@ -537,8 +605,17 @@ def process_language_split(
             with open(os.path.join(shard_dir, f"hard_pos_rank{r}.pkl"), "rb") as fh:
                 merged_pos.update(pickle.load(fh))
 
-        hard_neg_col = [merged_neg[i] for i in range(N)]
-        hard_pos_col = [merged_pos[i] for i in range(N)]
+        # Defensive: missing docIDs (e.g. partial pickle from a crashed rank)
+        # become empty lists rather than raising KeyError.
+        missing_neg = N - len(merged_neg)
+        missing_pos = N - len(merged_pos)
+        if missing_neg or missing_pos:
+            print(
+                f"[Rank 0] WARNING: {missing_neg} docs missing hard_neg, "
+                f"{missing_pos} docs missing hard_pos — filling with []"
+            )
+        hard_neg_col = [merged_neg.get(i, []) for i in range(N)]
+        hard_pos_col = [merged_pos.get(i, []) for i in range(N)]
 
         dataset = add_column_with_polars(dataset, "hard_negative_docIDs", hard_neg_col)
         dataset = add_column_with_polars(dataset, "hard_positive_docIDs", hard_pos_col)
@@ -597,8 +674,12 @@ def main() -> None:
         help="Cache directory for shard files, merged embeddings, and FAISS index",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=256,
-        help="Encoding/mining batch size per GPU",
+        "--batch-size", type=int, default=128,
+        help="Encoding batch size per GPU (number of texts per forward pass)",
+    )
+    parser.add_argument(
+        "--mine-batch-size", type=int, default=512,
+        help="FAISS query batch size during mining (CPU only, safe to be large)",
     )
     parser.add_argument(
         "--max-length", type=int, default=512,
@@ -612,6 +693,12 @@ def main() -> None:
         "--nprobe", type=int, default=128,
         help="FAISS search probes at query time (higher = better recall, slower)",
     )
+    parser.add_argument(
+        "--neg-buffer", type=int, default=4,
+        help="Over-fetch factor for FAISS search before same-author filtering "
+             "(fetch_k = top_k_neg * neg_buffer). Increase if many neighbours "
+             "share the query's author.",
+    )
     args = parser.parse_args()
 
     rank, world_size, _ = init_dist()
@@ -621,7 +708,7 @@ def main() -> None:
         os.makedirs(args.output_dir, exist_ok=True)
     barrier()
 
-    print(f"[Rank {rank}/{world_size}] Loading embedder from {args.embedder_config_dir!r} …")
+    print(f"[Rank {rank}/{world_size}] Loading embedder from {args.embedder_config_dir!r} …", flush=True)
     model = load_embedder(args.embedder_config_dir, args.embedder_checkpoint_path)
 
     if os.path.exists(args.dataset_name):
@@ -638,7 +725,9 @@ def main() -> None:
             print(f"[Rank {rank}] Skipping {lang!r}: not in dataset")
             continue
 
-        print(f"[Rank {rank}] Processing {lang!r}: {len(hf_data[lang]):,} documents")
+        N_total = len(hf_data[lang])
+        N_shard = len(range(rank, N_total, world_size))
+        print(f"[Rank {rank}] Processing {lang!r}: {N_total:,} total docs, {N_shard:,} this shard", flush=True)
         ds = process_language_split(
             dataset=hf_data[lang],
             lang=lang,
@@ -653,6 +742,8 @@ def main() -> None:
             rank=rank,
             world_size=world_size,
             dataset_key=dataset_key,
+            neg_buffer=args.neg_buffer,
+            mine_batch_size=args.mine_batch_size,
         )
         if is_main():
             result[lang] = ds

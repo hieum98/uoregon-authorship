@@ -1,0 +1,116 @@
+seed: 888
+num_workers: 16
+run_name: reranker-v6
+
+data:
+  dataset_names:
+    # English
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/reddit_dump_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/amazon_reviews_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/goodreads_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/hiatus-imdb_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/HNI_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/movie_reviews_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/MUD_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/nyt_comments_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/SXT_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/wiki_en_small_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/yelp_review_hard
+    # Chinese
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/dianping_review_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/douban_reviews_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/jd_reviews_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/weibo_full_hard
+    # Russian
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/proza_ru_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/ru_KP_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/ru_reddit_dump_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/ru_STX_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/ru_telegram_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/stihi_ru_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/wiki_ru_hard
+    # Multilingual
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/exorde_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/u-sticker_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/yt_comments_hard
+  languages: [en, zh, ru, ar, de, es, fr]
+  global_batch_size: 64
+  max_seq_length: 512
+  num_train_examples: 100000
+  num_pos_per_query: 2
+  num_neg_per_query: 2
+  negative_curriculum:
+    - easy: 1
+      semihard: 1
+      hard: 0
+    - easy: 0
+      semihard: 2
+      hard: 0
+    - easy: 0
+      semihard: 0
+      hard: 2
+  instruction: null
+
+model:
+  model_name_or_path: Qwen/Qwen3-4B
+  attn_implementation: flash_attention_2
+  quantization: false
+  lora:
+    use_lora: false
+    r: 16
+    alpha: 32
+    dropout: 0.1
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    name: default
+
+training:
+  output_dir: outputs/reranker-v6
+  devices: 4
+  precision: bf16-mixed
+  epochs: 3
+  lr: 5.0e-6
+  weight_decay: 0.1
+  warmup_steps: 200
+  min_reduce_rate: 0.05
+  grad_clip: 1.0
+  label_smoothing: 0.05
+  gradient_accumulation_steps: 8
+  checkpoint_interval: 2000
+  logger:
+    type: wandb
+    project: authorship-reranker
+
+evaluation:
+  genres:
+    - HRS2.1
+    - HRS2.2
+    - HRS2.3
+    - HRS2.4
+    - HRS2.5
+    - en_cross_genre_medium
+    - HRS2.101
+    - HRS2.102
+    - HRS2.103
+    - HRS2.104
+    - HRS2.105
+    - ru_cross_genre_long
+    - ru_cross_genre_medium
+    - HRS3.1
+    - HRS3.2
+    - HRS3.3
+    - HRS3.4
+    - HRS3.5
+    - en_cross_genre_short
+    - HRS3.301
+    - HRS3.302
+    - HRS3.303
+    - HRS3.304
+    - HRS3.305
+    - zh_cross_genre_medium
+    - zh_cross_genre_short
+  batch_size: 32
+  max_length: 512
+  top_k: 16
+  reranker_weight: 0.5
+  embedder_config_dir: null
+  embedder_checkpoint_path: null

@@ -5,3 +5,6 @@ outputs
 checkpoint
 eval_results
 CLAUDE.md
+/data/*
+logs
+merged_models_checkpoints.zip

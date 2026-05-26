@@ -14,11 +14,7 @@ import hydra
 import lightning as L
 import torch
 from omegaconf import DictConfig, OmegaConf
-from torch.distributed.fsdp.wrap import (
-    _or_policy,
-    lambda_auto_wrap_policy,
-    transformer_auto_wrap_policy,
-)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 from authorship.data.reranker_dataset import RerankerDataModule
 from authorship.models.reranker import RerankerModel
@@ -52,25 +48,17 @@ def _resolve_decoder_layer_cls(model_name: str):
 
 
 def _get_wrapping_policy(transformer_layer_cls):
-    def lambda_fn(module):
-        return (
-            len(list(module.named_children())) == 0
-            and getattr(module, "weight", None) is not None
-            and module.weight.requires_grad
-        )
     return functools.partial(
-        _or_policy,
-        policies=[
-            functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_fn),
-            functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={transformer_layer_cls}),
-        ],
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={transformer_layer_cls},
     )
 
 
-def train_step(fabric, model, batch):
+def train_step(fabric, model, batch, label_smoothing: float = 0.0):
     outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
     loss = compute_reranker_loss(
         outputs["true_logits"], outputs["false_logits"], batch["labels"],
+        label_smoothing=label_smoothing,
     )
     return loss, outputs
 
@@ -82,10 +70,11 @@ def fit_epoch(
     checkpoint_interval = config.training.get("checkpoint_interval", 2000)
     output_dir = config.training.output_dir
 
+    label_smoothing = config.training.get("label_smoothing", 0.0)
     model.train()
     for batch_idx, batch in enumerate(train_loader):
         t0 = time.perf_counter()
-        loss, outputs = train_step(fabric, model, batch)
+        loss, outputs = train_step(fabric, model, batch, label_smoothing=label_smoothing)
         fabric.backward(loss / grad_accum)
 
         if (batch_idx + 1) % grad_accum == 0:
@@ -107,12 +96,19 @@ def fit_epoch(
             fabric.log_dict({"loss": loss.item(), "lr": lr, **metrics}, step=total_step)
             fabric.print(
                 f"Epoch {epoch} | Step {batch_idx} | Loss: {loss.item():.4f} | "
-                f"Acc: {metrics['accuracy']:.3f} | F1: {metrics['f1']:.3f} | LR: {lr:.2e}"
+                f"Acc: {metrics['accuracy']:.3f} | F1: {metrics['f1']:.3f} | "
+                f"Pgap: {metrics['p_yes_gap']:+.3f} | LR: {lr:.2e}"
             )
 
         if batch_idx > 0 and batch_idx % checkpoint_interval == 0:
             ckpt_path = pathlib.Path(output_dir) / f"checkpoint_step{total_step}.ckpt"
             ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            # Release cached/fragmented memory before the FSDP all-gather; the
+            # consolidated save needs a temporary spike (~optimizer-state size).
+            import gc
+            del loss, outputs
+            gc.collect()
+            torch.cuda.empty_cache()
             fabric.save(ckpt_path, {
                 "model": model, "optimizer": optimizer, "scheduler": scheduler,
                 "epoch": epoch, "step": batch_idx,
@@ -150,7 +146,9 @@ def main(fabric, config):
         num_train_examples=config.data.get("num_train_examples", 50000),
         num_pos_per_query=config.data.get("num_pos_per_query", 1),
         num_neg_per_query=config.data.get("num_neg_per_query", 1),
+        num_epochs=config.training.get("epochs", 3),
         instruction=config.data.get("instruction"),
+        negative_curriculum=config.data.get("negative_curriculum"),
     )
     data_module.prepare_data()
     data_module.setup()
@@ -163,12 +161,37 @@ def main(fabric, config):
         weight_decay=config.training.get("weight_decay", 0.01),
     )
 
-    total_steps = len(train_loader) * config.training.get("epochs", 5)
+    epochs = config.training.get("epochs", 5)
+    grad_accum = config.training.get("gradient_accumulation_steps", 1)
+    batches_per_epoch = len(train_loader)
+    optimizer_steps_per_epoch = batches_per_epoch // grad_accum
+    total_steps = batches_per_epoch * epochs
+    total_optimizer_steps = optimizer_steps_per_epoch * epochs
+
+    fabric.print(
+        f"\n{'='*60}\n"
+        f"Data & schedule stats\n"
+        f"  batches/epoch:          {batches_per_epoch:,}\n"
+        f"  grad_accum_steps:       {grad_accum}\n"
+        f"  optimizer steps/epoch:  {optimizer_steps_per_epoch:,}\n"
+        f"  epochs:                 {epochs}\n"
+        f"  total optimizer steps:  {total_optimizer_steps:,}\n"
+        f"  total_steps (sched):    {total_steps:,}  "
+        f"[scheduler sees {total_optimizer_steps}/{total_steps} = "
+        f"{total_optimizer_steps/total_steps:.1%} of schedule]\n"
+        f"  warmup steps:           {config.training.get('warmup_steps', 100)}\n"
+        f"  lr:                     {config.training.lr}\n"
+        f"  min_lr:                 {config.training.lr * config.training.get('min_reduce_rate', 0.0):.2e}\n"
+        f"  negative curriculum:    {config.data.get('negative_curriculum')}\n"
+        f"{'='*60}\n"
+    )
+
     scheduler = get_cosine_annealing_schedule_with_warmup(
         optimizer,
         num_warmup_steps=config.training.get("warmup_steps", 100),
-        num_training_steps=total_steps,
+        num_training_steps=total_optimizer_steps,
         num_cycles=config.training.get("epochs", 5),
+        min_reduce_rate=config.training.get("min_reduce_rate", 0.0),
     )
 
     model, optimizer = fabric.setup(model, optimizer)
@@ -184,7 +207,7 @@ def _choose_logger(config: DictConfig, output_dir: pathlib.Path):
     run_name = config.get("run_name", "reranker")
 
     if logger_type == "wandb":
-        from lightning.fabric.loggers import WandbLogger
+        from lightning.pytorch.loggers import WandbLogger
         logger_dir = output_dir / "logs_wandb"
         logger_dir.mkdir(parents=True, exist_ok=True)
         return WandbLogger(
@@ -206,7 +229,10 @@ def setup(config: DictConfig):
     strategy = "auto"
     if config.training.get("devices", 1) > 1 and decoder_cls:
         from lightning.fabric.strategies import FSDPStrategy
-        strategy = FSDPStrategy(auto_wrap_policy=_get_wrapping_policy(decoder_cls))
+        strategy = FSDPStrategy(
+            auto_wrap_policy=_get_wrapping_policy(decoder_cls),
+            activation_checkpointing_policy={decoder_cls},
+        )
 
     logger = _choose_logger(config, output_dir)
 
@@ -217,7 +243,7 @@ def setup(config: DictConfig):
         strategy=strategy,
         loggers=[logger],
     )
-    fabric.launch(lambda: main(fabric, config))
+    fabric.launch(main, config=config)
 
 
 @hydra.main(version_base=None, config_path="../../configs/reranker", config_name="default")

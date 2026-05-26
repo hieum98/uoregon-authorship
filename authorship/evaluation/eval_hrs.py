@@ -39,17 +39,15 @@ import time
 from glob import glob
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
-from tqdm import tqdm
 import numpy as np
 import torch
 from omegaconf import OmegaConf
-from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
 
 from authorship.evaluation.constants import ALL_HRS_PATHS, GENRE_GROUPS
 from authorship.evaluation.evaluator import Evaluator
 from authorship.evaluation.hrs_loader import load_ta1, load_ta2
-from authorship.models.embedder import WrappedEmbeddingModel
-from authorship.models.reranker import WrappedRerankerModel
+from authorship.model import AuthorshipModel
 
 
 # Interrupt handling: set by SIGINT/SIGTERM; checked in genre loops for responsive Ctrl-C.
@@ -58,71 +56,73 @@ _sigint_count = 0
 
 
 # ---------------------------------------------------------------------------
-# Model loading helpers
+# Model loading helper
 # ---------------------------------------------------------------------------
 
-def _load_embedder(config_dir: str, checkpoint_path: str) -> WrappedEmbeddingModel:
-    cfg = OmegaConf.load(os.path.join(config_dir, "config.yaml"))
-    return WrappedEmbeddingModel(
-        model_name_or_path=cfg.model.model_name_or_path,
-        use_lora=cfg.model.lora.use_lora,
-        dropout_prob=cfg.model.get("dropout", 0.1),
-        lora_r=cfg.model.lora.get("r", 16),
-        lora_alpha=cfg.model.lora.get("alpha", 32),
-        lora_dropout=cfg.model.lora.get("dropout", 0.1),
-        target_modules=list(cfg.model.lora.get("target_modules", ["all"])),
-        adapter_name=cfg.model.lora.get("name"),
-        quantization=cfg.model.get("quantization", False),
-        attn_implementation=cfg.model.get("attn_implementation"),
-        pooling_method=cfg.model.get("pooling", "mean"),
-        is_bidirectional=cfg.model.get("is_bidirectional", False),
-        model_checkpoint=checkpoint_path,
+def _build_model(
+    mode: str,
+    config_dir: str,
+    checkpoint_path: str,
+    embedder_config_dir: Optional[str] = None,
+    embedder_checkpoint_path: Optional[str] = None,
+    batch_size: int = 32,
+    max_length: int = 512,
+) -> AuthorshipModel:
+    if mode == "embedder":
+        return AuthorshipModel(
+            embedder_config_path=os.path.join(config_dir, "config.yaml"),
+            embedder_checkpoint_path=checkpoint_path,
+            batch_size=batch_size,
+            embedder_max_length=max_length,
+        )
+    return AuthorshipModel(
+        embedder_config_path=os.path.join(embedder_config_dir, "config.yaml"),
+        embedder_checkpoint_path=embedder_checkpoint_path,
+        reranker_config_path=os.path.join(config_dir, "config.yaml"),
+        reranker_checkpoint_path=checkpoint_path,
+        batch_size=batch_size,
+        embedder_max_length=max_length,
     )
 
 
-def _load_reranker(config_dir: str, checkpoint_path: str) -> WrappedRerankerModel:
-    cfg = OmegaConf.load(os.path.join(config_dir, "config.yaml"))
-    return WrappedRerankerModel(
-        model_name_or_path=cfg.model.model_name_or_path,
-        use_lora=cfg.model.lora.use_lora,
-        lora_r=cfg.model.lora.get("r", 16),
-        lora_alpha=cfg.model.lora.get("alpha", 32),
-        lora_dropout=cfg.model.lora.get("dropout", 0.1),
-        target_modules=list(cfg.model.lora.get("target_modules", ["all"])),
-        adapter_name=cfg.model.lora.get("name"),
-        quantization=cfg.model.get("quantization", False),
-        attn_implementation=cfg.model.get("attn_implementation"),
-        model_checkpoint=checkpoint_path,
-        max_length=cfg.data.get("max_seq_length", 1024),
-        batch_size=cfg.data.get("global_batch_size", 8),
-        instruction=cfg.data.get("instruction"),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Encoding helpers
-# ---------------------------------------------------------------------------
-
-def _encode_texts(model: WrappedEmbeddingModel, texts: List[str], batch_size: int, max_length: int) -> np.ndarray:
-    embs = model.batch_encode(texts, max_length=max_length, batch_size=batch_size)
-    out = embs.cpu().float().numpy()
-    if np.isnan(out).any():
-        print("Warning: NaN in embeddings, replacing with zeros.")
-        out = np.nan_to_num(out)
-    return out
-
-
-def _encode_authors(model: WrappedEmbeddingModel, author_texts: List[List[str]], batch_size: int, max_length: int) -> np.ndarray:
-    """Mean-pool per-author document embeddings."""
-    author_embs = []
-    for docs in tqdm(author_texts, desc="Encoding authors", disable=len(author_texts) < 256):
-        embs = model.batch_encode(docs, max_length=max_length, batch_size=batch_size)
-        author_embs.append(embs.cpu().float().mean(dim=0).numpy())
-    out = np.stack(author_embs)
-    if np.isnan(out).any():
-        print("Warning: NaN in author embeddings, replacing with zeros.")
-        out = np.nan_to_num(out)
-    return out
+def _print_eval_setup(
+    mode: str,
+    *,
+    config_dir: str,
+    checkpoint_path: str,
+    embedder_config_dir: Optional[str] = None,
+    embedder_checkpoint_path: Optional[str] = None,
+    genres: List[str],
+    batch_size: int,
+    max_length: int,
+    top_k: Optional[int] = None,
+    reranker_weight: Optional[float] = None,
+) -> None:
+    """Print the resolved evaluation setup before model loading."""
+    lines = [
+        "=" * 60,
+        "Evaluation setup",
+        f"  mode:                {mode}",
+        f"  batch_size:          {batch_size}",
+        f"  max_length:          {max_length}",
+        f"  genres ({len(genres)}):" + (" " * (12 - len(str(len(genres))))) + ", ".join(genres),
+    ]
+    if mode == "embedder":
+        lines += [
+            f"  embedder_config:     {os.path.join(config_dir, 'config.yaml')}",
+            f"  embedder_checkpoint: {checkpoint_path}",
+        ]
+    else:
+        lines += [
+            f"  embedder_config:     {os.path.join(embedder_config_dir, 'config.yaml')}",
+            f"  embedder_checkpoint: {embedder_checkpoint_path}",
+            f"  reranker_config:     {os.path.join(config_dir, 'config.yaml')}",
+            f"  reranker_checkpoint: {checkpoint_path}",
+            f"  top_k:               {top_k}",
+            f"  reranker_weight:     {reranker_weight}",
+        ]
+    lines.append("=" * 60)
+    print("\n" + "\n".join(lines) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -147,10 +147,8 @@ def _get_ta2_data_paths(genre_paths: dict) -> dict:
 
 
 def evaluate_genre_embedder(
-    model: WrappedEmbeddingModel,
+    model: AuthorshipModel,
     genre: str,
-    batch_size: int = 32,
-    max_length: int = 512,
 ) -> Dict[str, float]:
     """Evaluate a single genre with the embedder (retriever-only)."""
     paths = ALL_HRS_PATHS[genre]
@@ -162,10 +160,7 @@ def evaluate_genre_embedder(
     queries_ta1, candidates_ta1, gt_positions = load_ta1(
         ta1["resample_queries"], ta1["resample_candidates"], ta1["ground_truth"],
     )
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        q_embs = _encode_texts(model, queries_ta1["text"], batch_size, max_length)
-        c_embs = _encode_texts(model, candidates_ta1["text"], batch_size, max_length)
-    scores_ta1 = cosine_similarity(q_embs, c_embs)
+    scores_ta1 = model.retrieve(queries_ta1["text"], candidates_ta1["text"])["scores"]
     ta1_metrics = evaluator.evaluate_ta1(scores_ta1, gt_positions)
     s_at_8 = ta1_metrics.get("Average Success at 8", ta1_metrics.get("S@8", 0.0))
     results[f"S@8/{genre}"] = float(s_at_8)
@@ -174,10 +169,7 @@ def evaluate_genre_embedder(
     try:
         ta2_paths = _get_ta2_data_paths(paths)
         queries_ta2, candidates_ta2, gt_matrix = load_ta2(**ta2_paths)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            q_author_embs = _encode_authors(model, queries_ta2["text"], batch_size, max_length)
-            c_author_embs = _encode_authors(model, candidates_ta2["text"], batch_size, max_length)
-        scores_ta2 = cosine_similarity(q_author_embs, c_author_embs)
+        scores_ta2 = model.score_author_matrix(queries_ta2["text"], candidates_ta2["text"])
         ta2_metrics = evaluator.evaluate_ta2(scores_ta2, gt_matrix)
         eer = ta2_metrics.get("Equal Error Rate", ta2_metrics.get("EER", 1.0))
         results[f"EER/{genre}"] = float(eer)
@@ -187,78 +179,130 @@ def evaluate_genre_embedder(
 
 
 def evaluate_genre_full_system(
-    embedder: WrappedEmbeddingModel,
-    reranker: WrappedRerankerModel,
+    model: AuthorshipModel,
     genre: str,
     top_k: int = 16,
     reranker_weight: float = 0.5,
-    batch_size: int = 32,
-    max_length: int = 512,
+    compare_embedder: bool = True,
 ) -> Dict[str, float]:
-    """Evaluate a single genre with the full retriever + reranker pipeline."""
+    """Evaluate one genre: embedder-only and (if loaded) embedder + reranker."""
     paths = ALL_HRS_PATHS[genre]
     evaluator = Evaluator()
     results: Dict[str, float] = {}
-    w = reranker_weight
 
-    # -- TA1: retrieve then rerank --
     ta1 = paths["TA1"]
     queries_ta1, candidates_ta1, gt_positions = load_ta1(
         ta1["resample_queries"], ta1["resample_candidates"], ta1["ground_truth"],
     )
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        q_embs = _encode_texts(embedder, queries_ta1["text"], batch_size, max_length)
-        c_embs = _encode_texts(embedder, candidates_ta1["text"], batch_size, max_length)
-    retriever_scores = cosine_similarity(q_embs, c_embs).astype(np.float32)
+    n_q, n_c = len(queries_ta1), len(candidates_ta1)
+    query_texts = list(queries_ta1["text"])
+    candidate_texts = list(candidates_ta1["text"])
 
-    reranked = np.copy(retriever_scores)
-    n_q = retriever_scores.shape[0]
-    for i in range(n_q):
-        top_indices = np.argsort(-retriever_scores[i])[:top_k]
-        q_texts = [queries_ta1["text"][i]] * len(top_indices)
-        c_texts = [candidates_ta1["text"][int(j)] for j in top_indices]
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            rr_scores = reranker.score_pairs(q_texts, c_texts)
-        for local_idx, global_idx in enumerate(top_indices):
-            reranked[i, global_idx] = w * rr_scores[local_idx] + (1.0 - w) * retriever_scores[i, global_idx]
+    if compare_embedder:
+        print(f"    TA1 embedder: {n_q} queries × {n_c} candidates")
+        scores_emb_ta1 = model.retrieve(query_texts, candidate_texts)["scores"]
+        emb_ta1 = evaluator.evaluate_ta1(scores_emb_ta1, gt_positions)
+        results[f"embedder_S@8/{genre}"] = float(
+            emb_ta1.get("Average Success at 8", emb_ta1.get("S@8", 0.0))
+        )
 
-    ta1_metrics = evaluator.evaluate_ta1(reranked, gt_positions)
-    s_at_8 = ta1_metrics.get("Average Success at 8", ta1_metrics.get("S@8", 0.0))
-    results[f"ta1_S@8/{genre}"] = float(s_at_8)
+    if model._reranker is not None:
+        print(f"    TA1 system: {n_q} queries × {n_c} candidates (top_k={top_k})")
+        scores_sys_ta1 = model.reranker(
+            query_texts, candidate_texts,
+            top_k=top_k, reranker_weight=reranker_weight,
+            progress_desc=f"{genre} TA1 rerank",
+        )["scores"]
+        sys_ta1 = evaluator.evaluate_ta1(scores_sys_ta1, gt_positions)
+        results[f"system_S@8/{genre}"] = float(
+            sys_ta1.get("Average Success at 8", sys_ta1.get("S@8", 0.0))
+        )
+    elif not compare_embedder:
+        scores_ta1 = model.retrieve(query_texts, candidate_texts)["scores"]
+        ta1_metrics = evaluator.evaluate_ta1(scores_ta1, gt_positions)
+        results[f"ta1_S@8/{genre}"] = float(
+            ta1_metrics.get("Average Success at 8", ta1_metrics.get("S@8", 0.0))
+        )
 
-    # -- TA2: author-level retrieve then rerank --
     try:
         ta2_paths = _get_ta2_data_paths(paths)
         queries_ta2, candidates_ta2, gt_matrix = load_ta2(**ta2_paths)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            q_author_embs = _encode_authors(embedder, queries_ta2["text"], batch_size, max_length)
-            c_author_embs = _encode_authors(embedder, candidates_ta2["text"], batch_size, max_length)
-        author_retriever = cosine_similarity(q_author_embs, c_author_embs).astype(np.float32)
+        q_authors = queries_ta2["text"]
+        c_authors = candidates_ta2["text"]
+        print(
+            f"    TA2: {len(queries_ta2)} query authors × {len(candidates_ta2)} candidates"
+            f" (top_k={top_k})"
+        )
 
-        author_reranked = np.copy(author_retriever)
-        n_qa = author_retriever.shape[0]
-        for i in range(n_qa):
-            top_indices = np.argsort(-author_retriever[i])[:top_k]
-            for j in top_indices:
-                q_docs = queries_ta2["text"][i]
-                c_docs = candidates_ta2["text"][int(j)]
-                pair_q = [qd for qd in q_docs for _ in c_docs]
-                pair_c = [cd for _ in q_docs for cd in c_docs]
-                if pair_q:
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
-                        pair_scores = reranker.score_pairs(pair_q, pair_c)
-                    rr = float(pair_scores.max())
-                else:
-                    rr = 0.0
-                author_reranked[i, int(j)] = w * rr + (1.0 - w) * author_retriever[i, int(j)]
+        if compare_embedder:
+            scores_emb_ta2 = model.score_author_matrix(
+                q_authors, c_authors, use_reranker=False,
+            )
+            emb_ta2 = evaluator.evaluate_ta2(scores_emb_ta2, gt_matrix)
+            results[f"embedder_EER/{genre}"] = float(
+                emb_ta2.get("Equal Error Rate", emb_ta2.get("EER", 1.0))
+            )
 
-        ta2_metrics = evaluator.evaluate_ta2(author_reranked, gt_matrix)
-        eer = ta2_metrics.get("Equal Error Rate", ta2_metrics.get("EER", 1.0))
-        results[f"ta2_EER/{genre}"] = float(eer)
+        if model._reranker is not None:
+            scores_sys_ta2 = model.score_author_matrix(
+                q_authors, c_authors,
+                top_k=top_k, reranker_weight=reranker_weight, use_reranker=True,
+            )
+            sys_ta2 = evaluator.evaluate_ta2(scores_sys_ta2, gt_matrix)
+            results[f"system_EER/{genre}"] = float(
+                sys_ta2.get("Equal Error Rate", sys_ta2.get("EER", 1.0))
+            )
     except (FileNotFoundError, KeyError) as e:
         print(f"  Skipping TA2 for {genre}: {e}")
 
     return results
+
+
+def _print_embedder_vs_system_summary(results: Dict[str, float], genres: List[str]) -> None:
+    """Print side-by-side embedder vs embedder+reranker metrics."""
+    evaluated = [g for g in genres if f"embedder_S@8/{g}" in results or f"system_S@8/{g}" in results]
+    if not evaluated:
+        return
+
+    print("\n" + "=" * 72)
+    print("Embedder-only vs Embedder + Reranker")
+    print("=" * 72)
+    print(f"{'Genre':<28} {'Emb S@8':>10} {'Sys S@8':>10} {'Δ S@8':>8} {'Emb EER':>10} {'Sys EER':>10} {'Δ EER':>8}")
+    print("-" * 72)
+
+    for genre in evaluated:
+        emb_s = results.get(f"embedder_S@8/{genre}")
+        sys_s = results.get(f"system_S@8/{genre}")
+        emb_e = results.get(f"embedder_EER/{genre}")
+        sys_e = results.get(f"system_EER/{genre}")
+
+        def _cell(v: Optional[float]) -> str:
+            return f"{v:>10.4f}" if v is not None else f"{'—':>10}"
+
+        delta_s = (sys_s - emb_s) if emb_s is not None and sys_s is not None else None
+        delta_e = (sys_e - emb_e) if emb_e is not None and sys_e is not None else None
+
+        ds = f"{delta_s:>+8.4f}" if delta_s is not None else f"{'—':>8}"
+        de = f"{delta_e:>+8.4f}" if delta_e is not None else f"{'—':>8}"
+        print(
+            f"{genre:<28} {_cell(emb_s)} {_cell(sys_s)} {ds} "
+            f"{_cell(emb_e)} {_cell(sys_e)} {de}"
+        )
+
+    def _avg(key_tpl: str) -> Optional[float]:
+        vals = [results[f"{key_tpl}/{g}"] for g in evaluated if f"{key_tpl}/{g}" in results]
+        return float(np.mean(vals)) if vals else None
+
+    emb_s, sys_s = _avg("embedder_S@8"), _avg("system_S@8")
+    emb_e, sys_e = _avg("embedder_EER"), _avg("system_EER")
+    print("-" * 72)
+    if emb_s is not None or sys_s is not None:
+        ds = f"{(sys_s - emb_s):>+8.4f}" if emb_s is not None and sys_s is not None else f"{'—':>8}"
+        de = f"{(sys_e - emb_e):>+8.4f}" if emb_e is not None and sys_e is not None else f"{'—':>8}"
+        print(
+            f"{'MEAN':<28} {_cell(emb_s)} {_cell(sys_s)} {ds} {_cell(emb_e)} {_cell(sys_e)} {de}"
+        )
+    print("=" * 72 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +337,12 @@ def evaluate_embedder(
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, float]:
     """Run embedder-only evaluation across all requested genres."""
+    _print_eval_setup(
+        "embedder", config_dir=config_dir, checkpoint_path=checkpoint_path,
+        genres=genres, batch_size=batch_size, max_length=max_length,
+    )
     print(f"Loading embedder from {checkpoint_path}...")
-    model = _load_embedder(config_dir, checkpoint_path)
+    model = _build_model("embedder", config_dir, checkpoint_path, batch_size=batch_size, max_length=max_length)
     results: Dict[str, float] = {}
     evaluated_genres: List[str] = []
 
@@ -306,7 +354,7 @@ def evaluate_embedder(
             print(f"  Skipping unknown genre: {genre}")
             continue
         print(f"  Evaluating {genre}...")
-        genre_results = evaluate_genre_embedder(model, genre, batch_size, max_length)
+        genre_results = evaluate_genre_embedder(model, genre)
         results.update(genre_results)
         evaluated_genres.append(genre)
         for k, v in sorted(genre_results.items()):
@@ -329,34 +377,53 @@ def evaluate_full_system(
     batch_size: int = 32,
     max_length: int = 512,
     cancel_check: Optional[Callable[[], bool]] = None,
+    compare_embedder: bool = True,
 ) -> Dict[str, float]:
-    """Run full-system (retriever + reranker) evaluation across all requested genres."""
+    """Run embedder-only and embedder+reranker evaluation (single model load)."""
+    _print_eval_setup(
+        "reranker", config_dir=config_dir, checkpoint_path=checkpoint_path,
+        embedder_config_dir=embedder_config_dir,
+        embedder_checkpoint_path=embedder_checkpoint_path,
+        genres=genres, batch_size=batch_size, max_length=max_length,
+        top_k=top_k, reranker_weight=reranker_weight,
+    )
     print(f"Loading embedder from {embedder_checkpoint_path}...")
-    embedder = _load_embedder(embedder_config_dir, embedder_checkpoint_path)
     print(f"Loading reranker from {checkpoint_path}...")
-    reranker_model = _load_reranker(config_dir, checkpoint_path)
+    model = _build_model(
+        "reranker", config_dir, checkpoint_path,
+        embedder_config_dir=embedder_config_dir,
+        embedder_checkpoint_path=embedder_checkpoint_path,
+        batch_size=batch_size, max_length=max_length,
+    )
     results: Dict[str, float] = {}
     evaluated_genres: List[str] = []
 
-    for genre in genres:
+    genre_bar = tqdm(genres, desc="HRS genres", unit="genre")
+    for genre in genre_bar:
         if cancel_check and cancel_check():
             print("  Interrupt requested, stopping evaluation.")
             break
         if genre not in ALL_HRS_PATHS:
             print(f"  Skipping unknown genre: {genre}")
             continue
+        genre_bar.set_postfix_str(genre)
         print(f"  Evaluating {genre}...")
         genre_results = evaluate_genre_full_system(
-            embedder, reranker_model, genre, top_k, reranker_weight, batch_size, max_length,
+            model, genre, top_k, reranker_weight, compare_embedder=compare_embedder,
         )
         results.update(genre_results)
         evaluated_genres.append(genre)
         for k, v in sorted(genre_results.items()):
             print(f"    {k}: {v:.4f}")
 
-    results.update(_compute_averages(results, evaluated_genres, prefix="ta1_"))
-    results.update(_compute_averages(results, evaluated_genres, prefix="ta2_"))
-    del embedder, reranker_model
+    if compare_embedder:
+        results.update(_compute_averages(results, evaluated_genres, prefix="embedder_"))
+        results.update(_compute_averages(results, evaluated_genres, prefix="system_"))
+        _print_embedder_vs_system_summary(results, evaluated_genres)
+    else:
+        results.update(_compute_averages(results, evaluated_genres, prefix="ta1_"))
+        results.update(_compute_averages(results, evaluated_genres, prefix="ta2_"))
+    del model
     torch.cuda.empty_cache()
     return results
 
@@ -476,6 +543,7 @@ def _run_single_eval(
             batch_size=args.batch_size,
             max_length=args.max_length,
             cancel_check=cancel_check,
+            compare_embedder=not getattr(args, "no_compare_embedder", False),
         )
     return results
 
@@ -599,6 +667,11 @@ def _add_common_args(parser: argparse.ArgumentParser):
     parser.add_argument("--embedder_checkpoint_path", default=None)
     parser.add_argument("--top_k", type=int, default=16)
     parser.add_argument("--reranker_weight", type=float, default=0.5)
+    parser.add_argument(
+        "--no_compare_embedder",
+        action="store_true",
+        help="Reranker mode only: skip embedder-only baseline (system metrics only)",
+    )
 
 
 def _resolve_genres(args):

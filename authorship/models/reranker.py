@@ -12,6 +12,7 @@ from typing import List, Optional, Union
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -182,26 +183,38 @@ class WrappedRerankerModel(nn.Module):
                 state.update(shard_state)
             return state
 
+        def _load_model_state(raw_state: dict) -> None:
+            nonlocal info
+            model_sd = raw_state["model"] if isinstance(raw_state, dict) and "model" in raw_state else raw_state
+            model_sd = self._normalize_state_dict_keys(model_sd)
+            info = self.model.load_state_dict(model_sd, strict=False)
+
         path_obj = Path(path)
+        info = None
         if path.endswith(".ckpt"):
-            state = torch.load(path, map_location="cpu")
-            info = self.model.load_state_dict(state["model"], strict=False)
+            _load_model_state(torch.load(path, map_location="cpu", weights_only=False))
         elif path.endswith(".pt"):
-            state = torch.load(path, map_location="cpu")
-            info = self.model.load_state_dict(state, strict=False)
+            _load_model_state(torch.load(path, map_location="cpu", weights_only=False))
         elif path.endswith(".safetensors"):
             from safetensors.torch import load_file
-            state = load_file(path, device="cpu")
-            info = self.model.load_state_dict(state, strict=False)
+            _load_model_state(load_file(path, device="cpu"))
         elif path.endswith(".safetensors.index.json"):
-            state = _load_sharded_safetensors(path)
-            info = self.model.load_state_dict(state, strict=False)
+            _load_model_state(_load_sharded_safetensors(path))
         elif path_obj.is_dir() and (path_obj / "model.safetensors.index.json").exists():
-            state = _load_sharded_safetensors(str(path_obj / "model.safetensors.index.json"))
-            info = self.model.load_state_dict(state, strict=False)
+            _load_model_state(_load_sharded_safetensors(str(path_obj / "model.safetensors.index.json")))
         else:
             raise ValueError(f"Unsupported checkpoint format: {path}")
         print(f"Loaded checkpoint {path} (missing: {info.missing_keys[:5]}...)")
+
+    @staticmethod
+    def _normalize_state_dict_keys(state_dict: dict) -> dict:
+        """Strip Fabric's extra ``model.`` prefix from consolidated FSDP checkpoints."""
+        if not state_dict:
+            return state_dict
+        keys = list(state_dict.keys())
+        if keys and all(k.startswith("model.model.") for k in keys):
+            return {k[len("model.") :]: v for k, v in state_dict.items()}
+        return state_dict
 
     @torch.no_grad()
     def score(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -212,12 +225,29 @@ class WrappedRerankerModel(nn.Module):
         return scores.cpu().float()
 
     @torch.no_grad()
-    def score_pairs(self, query_texts: List[str], doc_texts: List[str]) -> np.ndarray:
+    def score_pairs(
+        self,
+        query_texts: List[str],
+        doc_texts: List[str],
+        *,
+        desc: Optional[str] = "Reranking",
+        show_progress: bool = True,
+    ) -> np.ndarray:
         """Score parallel lists of (query, doc) text pairs. Returns (n,) array."""
         assert len(query_texts) == len(doc_texts)
         all_scores = []
-        for start in range(0, len(query_texts), self.batch_size):
-            end = min(start + self.batch_size, len(query_texts))
+        n_pairs = len(query_texts)
+        batch_starts = range(0, n_pairs, self.batch_size)
+        iterator = batch_starts
+        if show_progress and n_pairs > 0:
+            iterator = tqdm(
+                batch_starts,
+                desc=desc,
+                total=(n_pairs + self.batch_size - 1) // self.batch_size,
+                unit="batch",
+            )
+        for start in iterator:
+            end = min(start + self.batch_size, n_pairs)
             tokenized = [
                 tokenize_pair(q, d, self.tokenizer, self.max_length, self.instruction)
                 for q, d in zip(query_texts[start:end], doc_texts[start:end])
@@ -233,6 +263,9 @@ class WrappedRerankerModel(nn.Module):
         query_texts: List[str],
         candidate_texts: List[str],
         candidate_indices: Optional[np.ndarray] = None,
+        *,
+        desc: Optional[str] = "Reranking",
+        show_progress: bool = True,
     ) -> np.ndarray:
         """Build (n_q, n_c) score matrix. If candidate_indices given, only score those pairs."""
         n_q, n_c = len(query_texts), len(candidate_texts)
@@ -255,7 +288,12 @@ class WrappedRerankerModel(nn.Module):
                     all_pos.append((i, j))
 
         if all_q:
-            scores = self.score_pairs(all_q, all_d)
+            pair_desc = desc
+            if desc and len(all_q) > 0:
+                pair_desc = f"{desc} ({len(all_q)} pairs)"
+            scores = self.score_pairs(
+                all_q, all_d, desc=pair_desc, show_progress=show_progress,
+            )
             for idx, (i, j) in enumerate(all_pos):
                 score_mat[i, j] = scores[idx]
         return score_mat
