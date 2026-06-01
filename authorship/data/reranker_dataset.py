@@ -51,6 +51,10 @@ class PairwiseAuthorshipDataset(Dataset):
         self.epoch = 0
         self.rng = random.Random(seed)
         self.negative_curriculum = self._normalize_negative_curriculum(negative_curriculum)
+        # Diagnostics: fraction of queries that receive a genuine high-similarity
+        # ("easy") positive vs. falling back to a hard one (see _get_positives).
+        self._easy_pos_hits = 0
+        self._easy_pos_total = 0
 
         self.candidate_data = copy.deepcopy(candidate_data)
         data = copy.deepcopy(candidate_data)
@@ -85,13 +89,10 @@ class PairwiseAuthorshipDataset(Dataset):
         if not curriculum:
             return None
 
+        keys = ("random", "hard_q", "pos_med", "pos_hard")
         normalized = []
         for entry in curriculum:
-            counts = {
-                "easy": int(entry.get("easy", 0)),
-                "semihard": int(entry.get("semihard", 0)),
-                "hard": int(entry.get("hard", 0)),
-            }
+            counts = {k: int(entry.get(k, 0)) for k in keys}
             if any(v < 0 for v in counts.values()):
                 raise ValueError(f"Negative curriculum counts must be non-negative: {entry}")
             total = sum(counts.values())
@@ -104,75 +105,122 @@ class PairwiseAuthorshipDataset(Dataset):
         return normalized
 
     def _negative_plan(self) -> Dict[str, int]:
+        """Per-epoch negative composition.
+
+        Keys: ``random`` = n(r), ``hard_q`` = n(dq) (closest to query),
+        ``pos_med`` / ``pos_hard`` = n(dq+) (closest to the med / hard positive).
+        """
         if self.negative_curriculum:
             idx = min(self.epoch, len(self.negative_curriculum) - 1)
             return self.negative_curriculum[idx]
 
-        # Backward-compatible behavior: one easy calibration negative when the
-        # batch has room, with remaining negatives drawn from the hard window.
-        n_easy = 1 if self.num_neg >= 2 else 0
-        return {"easy": n_easy, "semihard": 0, "hard": self.num_neg - n_easy}
+        # No curriculum: default to all query-close (hardest) negatives.
+        return {"random": 0, "hard_q": self.num_neg, "pos_med": 0, "pos_hard": 0}
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
         self._resample(epoch)
+        self._easy_pos_hits = 0
+        self._easy_pos_total = 0
 
-    def _curriculum_neg_slice(self, neg_ids: list) -> list:
-        """Slide a window from medium-hard toward hardest over training epochs.
+    @property
+    def easy_pos_fraction(self) -> float:
+        """Share of sampled queries that got a genuine high-similarity positive."""
+        return self._easy_pos_hits / self._easy_pos_total if self._easy_pos_total else 0.0
 
-        neg_ids is sorted hardest-first (descending cosine sim). Each epoch the
-        window moves toward index 0. Final epoch always uses the hardest slice.
+    def _closest_cross_author(self, neg_ids: list, author_id: Any, count: int) -> List[dict]:
+        """Return the ``count`` closest different-author docs.
+
+        ``neg_ids`` is a closest-first list (highest embedder cosine first), so the
+        head holds the hardest negatives. We take a generous top window, drop any
+        same-author docs, and keep the closest ``count``.
         """
-        n = len(neg_ids)
-        if n == 0:
+        if count <= 0 or not neg_ids:
             return []
-        window = min(n, max(self.num_neg * 2, n // (2 ** self.num_epochs)))
-        remaining = max(0, self.num_epochs - 1 - self.epoch)
-        start = min(window * remaining, n - window)
-        return neg_ids[start : start + window]
+        window = neg_ids[: max(count * 6, 32)]
+        rows = self.candidate_data.select(window).to_list()
+        return [c for c in rows if c["authorIDs"] != author_id][:count]
 
-    def _hard_neg_slice(self, neg_ids: list) -> list:
-        """Return the hardest BM25/embedder negatives."""
-        window = max(self.num_neg * 3, 1)
-        return neg_ids[:window]
+    def _get_positives(self, example: dict) -> Dict[str, Optional[dict]]:
+        """Pick up to three same-author positives by difficulty.
 
-    def _get_positives(self, example: dict) -> List[dict]:
-        pos_ids = example.get("hard_positive_docIDs") or example.get("sameAuthor_docIDs", [])
-        if not pos_ids:
+        Roles (ordered): ``random`` — a natural (non-hard) same-author doc, tends
+        high-similarity/easy; ``med`` — the middle of the hardest (lowest-cosine)
+        same-author band; ``hard`` — the most dissimilar same-author doc.
+
+        ``hard_positive_docIDs`` is the mined hardest same-author subset, hardest-
+        first; ``sameAuthor_docIDs`` is the full set (includes the high-similarity
+        docs). Each returned value is a full candidate row carrying its own
+        ``hard_negative_docIDs`` — used to mine n(dq+) negatives close to that
+        positive (see ``_get_negatives``).
+        """
+        natural_ids = list(example.get("sameAuthor_docIDs", []))
+        hard_ids = list(example.get("hard_positive_docIDs") or [])
+        q_text = example["fullText"]
+        roles: Dict[str, Optional[Any]] = {"random": None, "med": None, "hard": None}
+
+        # No same-author refs: fall back to a half-text self-positive.
+        if not (natural_ids or hard_ids):
             fb = copy.deepcopy(example)
             words = fb["fullText"].split()
             fb["fullText"] = " ".join(words[: len(words) // 2])
-            return [fb]
-        # Anchor on (hardest, easiest) plus evenly-spaced middles. pos_ids is
-        # sorted hardest-first (low cosine), so index 0 is the calibration
-        # challenge and index -1 is the "obvious yes" anchor. The easy anchor
-        # gives the model a reference for what high confidence should feel like.
-        if self.num_pos >= 2 and len(pos_ids) >= 2:
-            picks = self._span_indices(len(pos_ids), self.num_pos)
-            return self.candidate_data.select([pos_ids[i] for i in picks]).to_list()
-        return self.candidate_data.select(pos_ids[: self.num_pos]).to_list()
+            roles["random"] = fb
+            self._easy_pos_total += 1
+            return roles
 
-    @staticmethod
-    def _span_indices(n: int, k: int) -> List[int]:
-        """k indices spanning [0, n-1] inclusive, evenly spaced."""
-        if k <= 1:
-            return [0]
-        if k >= n:
-            return list(range(n))
-        return [round(i * (n - 1) / (k - 1)) for i in range(k)]
+        used: set = set()
 
-    def _select_indexed_negatives(self, neg_ids: list, author_id: Any, count: int, hardness: str) -> List[dict]:
-        if count <= 0 or not neg_ids:
-            return []
-        if hardness == "hard":
-            sliced = self._hard_neg_slice(neg_ids)
-        elif hardness == "semihard":
-            sliced = self._curriculum_neg_slice(neg_ids)
-        else:
-            raise ValueError(f"Unknown negative hardness: {hardness}")
+        # HARD: most dissimilar same-author doc (head of hardest-first list).
+        for cid in hard_ids:
+            if cid not in used:
+                roles["hard"] = cid
+                used.add(cid)
+                break
 
-        cands = self.candidate_data.select(sliced[: count * 4]).to_list()
-        return [c for c in cands if c["authorIDs"] != author_id][:count]
+        # MED: middle of the hard band; scan outward from the centre for an unused id.
+        if hard_ids:
+            mid = len(hard_ids) // 2
+            for k in sorted(range(len(hard_ids)), key=lambda k: abs(k - mid)):
+                if hard_ids[k] not in used:
+                    roles["med"] = hard_ids[k]
+                    used.add(hard_ids[k])
+                    break
+
+        # RANDOM: a natural (non-hard) same-author doc; high-similarity/easy anchor.
+        hard_set = set(hard_ids)
+        easy_pool = [i for i in natural_ids if i not in hard_set and i not in used]
+        got_easy = False
+        for _ in range(10):
+            if not easy_pool:
+                break
+            cand = self.rng.choice(easy_pool)
+            if self.candidate_data[cand]["fullText"] != q_text:
+                roles["random"] = cand
+                used.add(cand)
+                got_easy = True
+                break
+        # Fallbacks: least-hard hard id, then any unused natural id.
+        if roles["random"] is None:
+            for cid in reversed(hard_ids):
+                if cid not in used:
+                    roles["random"] = cid
+                    used.add(cid)
+                    break
+        if roles["random"] is None:
+            for cid in natural_ids:
+                if cid not in used:
+                    roles["random"] = cid
+                    used.add(cid)
+                    break
+
+        self._easy_pos_hits += int(got_easy)
+        self._easy_pos_total += 1
+
+        # Materialize chosen docIDs into full candidate rows (carry hard_negative_docIDs).
+        for role, cid in list(roles.items()):
+            if cid is not None and not isinstance(cid, dict):
+                roles[role] = self.candidate_data[int(cid)]
+        return roles
 
     def _sample_easy_negatives(self, author_id: Any, count: int) -> List[dict]:
         if count <= 0:
@@ -210,18 +258,36 @@ class PairwiseAuthorshipDataset(Dataset):
             negs.extend(c for c in self.candidate_data.select(extra).to_list() if c["authorIDs"] != author_id)
         return self._dedupe_docs(negs)[: self.num_neg]
 
-    def _get_negatives(self, example: dict) -> List[dict]:
-        """Compose negatives according to the configured hardness curriculum."""
+    def _get_negatives(self, example: dict, positives: Dict[str, Optional[dict]]) -> List[dict]:
+        """Compose negatives per the curriculum stage (paper-style 3-way + close-to-positive).
+
+        Categories: ``random`` = n(r) random different-author docs; ``hard_q`` = n(dq)
+        different-author docs closest to the QUERY; ``pos_med`` / ``pos_hard`` = n(dq+)
+        different-author docs closest to the MED / HARD positive. Closeness uses the
+        finetuned-embedder ``hard_negative_docIDs`` (closest-first) of the query / positive.
+        """
         author_id = example["authorIDs"]
         plan = self._negative_plan()
-        neg_ids = example.get("hard_negative_docIDs") or example.get("BM25_retrieved_docIDs", [])
-
         negs: List[dict] = []
-        negs.extend(self._sample_easy_negatives(author_id, plan["easy"]))
-        negs.extend(self._select_indexed_negatives(neg_ids, author_id, plan["semihard"], "semihard"))
-        negs.extend(self._select_indexed_negatives(neg_ids, author_id, plan["hard"], "hard"))
-        negs = self._dedupe_docs(negs)
 
+        # n(r): random different-author docs.
+        negs.extend(self._sample_easy_negatives(author_id, plan.get("random", 0)))
+
+        # n(dq): different-author docs closest to the query.
+        q_neg_ids = example.get("hard_negative_docIDs") or example.get("BM25_retrieved_docIDs", [])
+        negs.extend(self._closest_cross_author(q_neg_ids, author_id, plan.get("hard_q", 0)))
+
+        # n(dq+): different-author docs closest to the med / hard positive.
+        med = positives.get("med")
+        if med is not None:
+            negs.extend(self._closest_cross_author(
+                med.get("hard_negative_docIDs", []), author_id, plan.get("pos_med", 0)))
+        hard = positives.get("hard")
+        if hard is not None:
+            negs.extend(self._closest_cross_author(
+                hard.get("hard_negative_docIDs", []), author_id, plan.get("pos_hard", 0)))
+
+        negs = self._dedupe_docs(negs)
         return self._backfill_negatives(negs, author_id)
 
     def __len__(self):
@@ -229,10 +295,12 @@ class PairwiseAuthorshipDataset(Dataset):
 
     def __getitem__(self, index) -> List[Dict[str, Any]]:
         query = self.data[index]
+        positives = self._get_positives(query)
         pairs = []
-        for pos in self._get_positives(query):
-            pairs.append({"query_text": query["fullText"], "doc_text": pos["fullText"], "label": 1})
-        for neg in self._get_negatives(query):
+        for pos in positives.values():
+            if pos is not None:
+                pairs.append({"query_text": query["fullText"], "doc_text": pos["fullText"], "label": 1})
+        for neg in self._get_negatives(query, positives):
             pairs.append({"query_text": query["fullText"], "doc_text": neg["fullText"], "label": 0})
         self.rng.shuffle(pairs)
         return pairs
@@ -247,20 +315,22 @@ class PairwiseCollator:
         self.instruction = instruction
 
     def __call__(self, batch: List[List[Dict[str, Any]]]) -> Dict[str, torch.Tensor]:
-        all_pairs = [p for group in batch for p in group]
-        tokenized, labels = [], []
-        for pair in all_pairs:
-            tokenized.append(tokenize_pair(
-                pair["query_text"], pair["doc_text"],
-                self.tokenizer, self.max_seq_length, self.instruction,
-            ))
-            labels.append(pair["label"])
+        tokenized, labels, group_ids = [], [], []
+        for group_idx, group in enumerate(batch):
+            for pair in group:
+                tokenized.append(tokenize_pair(
+                    pair["query_text"], pair["doc_text"],
+                    self.tokenizer, self.max_seq_length, self.instruction,
+                ))
+                labels.append(pair["label"])
+                group_ids.append(group_idx)
 
         padded = self.tokenizer.pad(tokenized, padding="max_length", max_length=self.max_seq_length, return_tensors="pt")
         return {
             "input_ids": padded["input_ids"],
             "attention_mask": padded["attention_mask"],
             "labels": torch.tensor(labels, dtype=torch.float32),
+            "group_ids": torch.tensor(group_ids, dtype=torch.long),
         }
 
 

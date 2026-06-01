@@ -54,11 +54,23 @@ def _get_wrapping_policy(transformer_layer_cls):
     )
 
 
-def train_step(fabric, model, batch, label_smoothing: float = 0.0):
+def train_step(
+    fabric,
+    model,
+    batch,
+    label_smoothing: float = 0.0,
+    ranking_loss_weight: float = 0.0,
+    ranking_margin: float = 0.0,
+    pos_weight: float = 1.0,
+):
     outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
     loss = compute_reranker_loss(
         outputs["true_logits"], outputs["false_logits"], batch["labels"],
         label_smoothing=label_smoothing,
+        group_ids=batch.get("group_ids"),
+        ranking_loss_weight=ranking_loss_weight,
+        ranking_margin=ranking_margin,
+        pos_weight=pos_weight,
     )
     return loss, outputs
 
@@ -71,10 +83,21 @@ def fit_epoch(
     output_dir = config.training.output_dir
 
     label_smoothing = config.training.get("label_smoothing", 0.0)
+    ranking_loss_weight = config.training.get("ranking_loss_weight", 0.0)
+    ranking_margin = config.training.get("ranking_margin", 0.0)
+    pos_weight = config.training.get("pos_weight", 1.0)
     model.train()
     for batch_idx, batch in enumerate(train_loader):
         t0 = time.perf_counter()
-        loss, outputs = train_step(fabric, model, batch, label_smoothing=label_smoothing)
+        loss, outputs = train_step(
+            fabric,
+            model,
+            batch,
+            label_smoothing=label_smoothing,
+            ranking_loss_weight=ranking_loss_weight,
+            ranking_margin=ranking_margin,
+            pos_weight=pos_weight,
+        )
         fabric.backward(loss / grad_accum)
 
         if (batch_idx + 1) % grad_accum == 0:
@@ -91,30 +114,36 @@ def fit_epoch(
                 outputs["true_logits"].detach(),
                 outputs["false_logits"].detach(),
                 batch["labels"],
+                group_ids=batch.get("group_ids"),
             )
             lr = scheduler.get_last_lr()[0] if scheduler else optimizer.param_groups[0]["lr"]
             fabric.log_dict({"loss": loss.item(), "lr": lr, **metrics}, step=total_step)
             fabric.print(
                 f"Epoch {epoch} | Step {batch_idx} | Loss: {loss.item():.4f} | "
                 f"Acc: {metrics['accuracy']:.3f} | F1: {metrics['f1']:.3f} | "
-                f"Pgap: {metrics['p_yes_gap']:+.3f} | LR: {lr:.2e}"
+                f"Pgap: {metrics['p_yes_gap']:+.3f} | "
+                f"PairAcc: {metrics.get('pairwise_accuracy', 0.0):.3f} | LR: {lr:.2e}"
             )
 
         if batch_idx > 0 and batch_idx % checkpoint_interval == 0:
             ckpt_path = pathlib.Path(output_dir) / f"checkpoint_step{total_step}.ckpt"
             ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-            # Release cached/fragmented memory before the FSDP all-gather; the
-            # consolidated save needs a temporary spike (~optimizer-state size).
+            fabric.print(f"Saving checkpoint: {ckpt_path}")
+            fabric.barrier()
+            # Release cached/fragmented memory before FSDP state collection.
             import gc
             del loss, outputs
             gc.collect()
             torch.cuda.empty_cache()
-            fabric.save(ckpt_path, {
-                "model": model, "optimizer": optimizer, "scheduler": scheduler,
-                "epoch": epoch, "step": batch_idx,
-            })
+            save_state = {"model": model, "epoch": epoch, "step": batch_idx}
+            if config.training.get("checkpoint_save_optimizer", False):
+                save_state["optimizer"] = optimizer
+            if config.training.get("checkpoint_save_scheduler", False):
+                save_state["scheduler"] = scheduler
+            fabric.save(ckpt_path, save_state)
             pathlib.Path(str(ckpt_path) + ".done").touch()
             fabric.print(f"Saved checkpoint: {ckpt_path}")
+            fabric.barrier()
 
 
 def main(fabric, config):
@@ -182,6 +211,9 @@ def main(fabric, config):
         f"  warmup steps:           {config.training.get('warmup_steps', 100)}\n"
         f"  lr:                     {config.training.lr}\n"
         f"  min_lr:                 {config.training.lr * config.training.get('min_reduce_rate', 0.0):.2e}\n"
+        f"  ranking_loss_weight:    {config.training.get('ranking_loss_weight', 0.0)}\n"
+        f"  ranking_margin:         {config.training.get('ranking_margin', 0.0)}\n"
+        f"  pos_weight:             {config.training.get('pos_weight', 1.0)}\n"
         f"  negative curriculum:    {config.data.get('negative_curriculum')}\n"
         f"{'='*60}\n"
     )
@@ -199,6 +231,14 @@ def main(fabric, config):
     for epoch in range(config.training.get("epochs", 5)):
         data_module.set_epoch(epoch)
         fit_epoch(fabric, model, optimizer, scheduler, train_loader, config, epoch)
+        # Diagnostic: what fraction of queries got a genuine high-similarity
+        # positive this epoch (vs. falling back to a hard one). Low => mining
+        # top_k_pos is too small and positives stay all-hard.
+        if fabric.global_rank == 0:
+            hits = sum(ds._easy_pos_hits for ds in data_module._datasets)
+            total = sum(ds._easy_pos_total for ds in data_module._datasets)
+            frac = hits / total if total else 0.0
+            fabric.print(f"[epoch {epoch}] easy-positive fraction: {frac:.3f} ({hits}/{total})")
 
 
 def _choose_logger(config: DictConfig, output_dir: pathlib.Path):

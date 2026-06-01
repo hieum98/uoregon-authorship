@@ -67,6 +67,8 @@ def _build_model(
     embedder_checkpoint_path: Optional[str] = None,
     batch_size: int = 32,
     max_length: int = 512,
+    reranker_agg: str = "max",
+    reranker_agg_topk: int = 3,
 ) -> AuthorshipModel:
     if mode == "embedder":
         return AuthorshipModel(
@@ -82,6 +84,8 @@ def _build_model(
         reranker_checkpoint_path=checkpoint_path,
         batch_size=batch_size,
         embedder_max_length=max_length,
+        reranker_agg=reranker_agg,
+        reranker_agg_topk=reranker_agg_topk,
     )
 
 
@@ -198,9 +202,15 @@ def evaluate_genre_full_system(
     query_texts = list(queries_ta1["text"])
     candidate_texts = list(candidates_ta1["text"])
 
+    # Encode queries/candidates once and reuse for both the embedder-only and the
+    # embedder+reranker paths — the reranker only needs these embeddings for its
+    # retrieval step, so there is no reason to run the 8B embedder twice.
+    query_emb_ta1 = model.encode(query_texts)
+    candidate_emb_ta1 = model.encode(candidate_texts)
+
     if compare_embedder:
         print(f"    TA1 embedder: {n_q} queries × {n_c} candidates")
-        scores_emb_ta1 = model.retrieve(query_texts, candidate_texts)["scores"]
+        scores_emb_ta1 = model.retrieve(query_emb_ta1, candidate_emb_ta1)["scores"]
         emb_ta1 = evaluator.evaluate_ta1(scores_emb_ta1, gt_positions)
         results[f"embedder_S@8/{genre}"] = float(
             emb_ta1.get("Average Success at 8", emb_ta1.get("S@8", 0.0))
@@ -211,6 +221,7 @@ def evaluate_genre_full_system(
         scores_sys_ta1 = model.reranker(
             query_texts, candidate_texts,
             top_k=top_k, reranker_weight=reranker_weight,
+            query_embeddings=query_emb_ta1, candidate_embeddings=candidate_emb_ta1,
             progress_desc=f"{genre} TA1 rerank",
         )["scores"]
         sys_ta1 = evaluator.evaluate_ta1(scores_sys_ta1, gt_positions)
@@ -218,7 +229,7 @@ def evaluate_genre_full_system(
             sys_ta1.get("Average Success at 8", sys_ta1.get("S@8", 0.0))
         )
     elif not compare_embedder:
-        scores_ta1 = model.retrieve(query_texts, candidate_texts)["scores"]
+        scores_ta1 = model.retrieve(query_emb_ta1, candidate_emb_ta1)["scores"]
         ta1_metrics = evaluator.evaluate_ta1(scores_ta1, gt_positions)
         results[f"ta1_S@8/{genre}"] = float(
             ta1_metrics.get("Average Success at 8", ta1_metrics.get("S@8", 0.0))
@@ -234,9 +245,17 @@ def evaluate_genre_full_system(
             f" (top_k={top_k})"
         )
 
+        # Mean-pool each portfolio once and reuse across both scoring paths to
+        # avoid running the embedder twice over the same author documents.
+        q_emb_ta2 = c_emb_ta2 = None
+        if compare_embedder or model._reranker is not None:
+            q_emb_ta2 = model.encode_authors(q_authors)
+            c_emb_ta2 = model.encode_authors(c_authors)
+
         if compare_embedder:
             scores_emb_ta2 = model.score_author_matrix(
                 q_authors, c_authors, use_reranker=False,
+                query_embeddings=q_emb_ta2, candidate_embeddings=c_emb_ta2,
             )
             emb_ta2 = evaluator.evaluate_ta2(scores_emb_ta2, gt_matrix)
             results[f"embedder_EER/{genre}"] = float(
@@ -247,6 +266,7 @@ def evaluate_genre_full_system(
             scores_sys_ta2 = model.score_author_matrix(
                 q_authors, c_authors,
                 top_k=top_k, reranker_weight=reranker_weight, use_reranker=True,
+                query_embeddings=q_emb_ta2, candidate_embeddings=c_emb_ta2,
             )
             sys_ta2 = evaluator.evaluate_ta2(scores_sys_ta2, gt_matrix)
             results[f"system_EER/{genre}"] = float(
@@ -258,17 +278,24 @@ def evaluate_genre_full_system(
     return results
 
 
-def _print_embedder_vs_system_summary(results: Dict[str, float], genres: List[str]) -> None:
-    """Print side-by-side embedder vs embedder+reranker metrics."""
+def _format_embedder_vs_system_summary(results: Dict[str, float], genres: List[str]) -> str:
+    """Build the side-by-side embedder vs embedder+reranker table as a string.
+
+    Returns an empty string if no relevant metrics are present.
+    """
     evaluated = [g for g in genres if f"embedder_S@8/{g}" in results or f"system_S@8/{g}" in results]
     if not evaluated:
-        return
+        return ""
 
-    print("\n" + "=" * 72)
-    print("Embedder-only vs Embedder + Reranker")
-    print("=" * 72)
-    print(f"{'Genre':<28} {'Emb S@8':>10} {'Sys S@8':>10} {'Δ S@8':>8} {'Emb EER':>10} {'Sys EER':>10} {'Δ EER':>8}")
-    print("-" * 72)
+    lines: List[str] = []
+    lines.append("=" * 72)
+    lines.append("Embedder-only vs Embedder + Reranker")
+    lines.append("=" * 72)
+    lines.append(f"{'Genre':<28} {'Emb S@8':>10} {'Sys S@8':>10} {'Δ S@8':>8} {'Emb EER':>10} {'Sys EER':>10} {'Δ EER':>8}")
+    lines.append("-" * 72)
+
+    def _cell(v: Optional[float]) -> str:
+        return f"{v:>10.4f}" if v is not None else f"{'—':>10}"
 
     for genre in evaluated:
         emb_s = results.get(f"embedder_S@8/{genre}")
@@ -276,15 +303,12 @@ def _print_embedder_vs_system_summary(results: Dict[str, float], genres: List[st
         emb_e = results.get(f"embedder_EER/{genre}")
         sys_e = results.get(f"system_EER/{genre}")
 
-        def _cell(v: Optional[float]) -> str:
-            return f"{v:>10.4f}" if v is not None else f"{'—':>10}"
-
         delta_s = (sys_s - emb_s) if emb_s is not None and sys_s is not None else None
         delta_e = (sys_e - emb_e) if emb_e is not None and sys_e is not None else None
 
         ds = f"{delta_s:>+8.4f}" if delta_s is not None else f"{'—':>8}"
         de = f"{delta_e:>+8.4f}" if delta_e is not None else f"{'—':>8}"
-        print(
+        lines.append(
             f"{genre:<28} {_cell(emb_s)} {_cell(sys_s)} {ds} "
             f"{_cell(emb_e)} {_cell(sys_e)} {de}"
         )
@@ -295,14 +319,22 @@ def _print_embedder_vs_system_summary(results: Dict[str, float], genres: List[st
 
     emb_s, sys_s = _avg("embedder_S@8"), _avg("system_S@8")
     emb_e, sys_e = _avg("embedder_EER"), _avg("system_EER")
-    print("-" * 72)
+    lines.append("-" * 72)
     if emb_s is not None or sys_s is not None:
         ds = f"{(sys_s - emb_s):>+8.4f}" if emb_s is not None and sys_s is not None else f"{'—':>8}"
         de = f"{(sys_e - emb_e):>+8.4f}" if emb_e is not None and sys_e is not None else f"{'—':>8}"
-        print(
+        lines.append(
             f"{'MEAN':<28} {_cell(emb_s)} {_cell(sys_s)} {ds} {_cell(emb_e)} {_cell(sys_e)} {de}"
         )
-    print("=" * 72 + "\n")
+    lines.append("=" * 72)
+    return "\n".join(lines)
+
+
+def _print_embedder_vs_system_summary(results: Dict[str, float], genres: List[str]) -> None:
+    """Print side-by-side embedder vs embedder+reranker metrics."""
+    table = _format_embedder_vs_system_summary(results, genres)
+    if table:
+        print("\n" + table + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +410,8 @@ def evaluate_full_system(
     max_length: int = 512,
     cancel_check: Optional[Callable[[], bool]] = None,
     compare_embedder: bool = True,
+    reranker_agg: str = "max",
+    reranker_agg_topk: int = 3,
 ) -> Dict[str, float]:
     """Run embedder-only and embedder+reranker evaluation (single model load)."""
     _print_eval_setup(
@@ -387,6 +421,7 @@ def evaluate_full_system(
         genres=genres, batch_size=batch_size, max_length=max_length,
         top_k=top_k, reranker_weight=reranker_weight,
     )
+    print(f"  TA2 aggregation:     {reranker_agg}" + (f" (k={reranker_agg_topk})" if reranker_agg == "topk_mean" else ""))
     print(f"Loading embedder from {embedder_checkpoint_path}...")
     print(f"Loading reranker from {checkpoint_path}...")
     model = _build_model(
@@ -394,6 +429,7 @@ def evaluate_full_system(
         embedder_config_dir=embedder_config_dir,
         embedder_checkpoint_path=embedder_checkpoint_path,
         batch_size=batch_size, max_length=max_length,
+        reranker_agg=reranker_agg, reranker_agg_topk=reranker_agg_topk,
     )
     results: Dict[str, float] = {}
     evaluated_genres: List[str] = []
@@ -544,6 +580,8 @@ def _run_single_eval(
             max_length=args.max_length,
             cancel_check=cancel_check,
             compare_embedder=not getattr(args, "no_compare_embedder", False),
+            reranker_agg=getattr(args, "reranker_agg", "max"),
+            reranker_agg_topk=getattr(args, "reranker_agg_topk", 3),
         )
     return results
 
@@ -668,6 +706,14 @@ def _add_common_args(parser: argparse.ArgumentParser):
     parser.add_argument("--top_k", type=int, default=16)
     parser.add_argument("--reranker_weight", type=float, default=0.5)
     parser.add_argument(
+        "--reranker_agg", choices=["max", "mean", "topk_mean"], default="max",
+        help="TA2 doc-pair aggregation into an author score (default: max)",
+    )
+    parser.add_argument(
+        "--reranker_agg_topk", type=int, default=3,
+        help="k for --reranker_agg topk_mean (mean of the top-k doc pairs)",
+    )
+    parser.add_argument(
         "--no_compare_embedder",
         action="store_true",
         help="Reranker mode only: skip embedder-only baseline (system metrics only)",
@@ -746,7 +792,14 @@ def main():
             results = _run_single_eval(
                 args, args.checkpoint_path, cancel_check=lambda: _interrupt_requested
             )
-            _save_results(results, args.output_dir, Path(args.checkpoint_path).stem)
+            stem = Path(args.checkpoint_path).stem
+            _save_results(results, args.output_dir, stem)
+            if args.mode == "reranker" and not getattr(args, "no_compare_embedder", False):
+                table = _format_embedder_vs_system_summary(results, args.genres)
+                if table:
+                    txt_path = Path(args.output_dir) / f"{stem}.txt"
+                    txt_path.write_text(table + "\n")
+                    print(f"Summary table saved to {txt_path}")
             if wb_run:
                 import wandb
                 step = _parse_step_from_filename(Path(args.checkpoint_path).name)

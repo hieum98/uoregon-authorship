@@ -8,3 +8,4 @@ CLAUDE.md
 /data/*
 logs
 merged_models_checkpoints.zip
+docs/reranker_shortcut_learning.md

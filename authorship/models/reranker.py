@@ -235,11 +235,26 @@ class WrappedRerankerModel(nn.Module):
     ) -> np.ndarray:
         """Score parallel lists of (query, doc) text pairs. Returns (n,) array."""
         assert len(query_texts) == len(doc_texts)
-        all_scores = []
         n_pairs = len(query_texts)
+        if n_pairs == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        # Tokenize all pairs up front, then sort by length so each batch groups
+        # similarly-sized sequences. Combined with dynamic padding this minimizes
+        # padding waste when the caller hands us a large, length-varied set of
+        # pairs (e.g. all doc pairs for a query author at once). Each sequence's
+        # P(yes) score is independent of its batch-mates, so reordering does not
+        # change results; scores are scattered back into the input order below.
+        tokenized_all = [
+            tokenize_pair(q, d, self.tokenizer, self.max_length, self.instruction)
+            for q, d in zip(query_texts, doc_texts)
+        ]
+        order = sorted(range(n_pairs), key=lambda idx: len(tokenized_all[idx]["input_ids"]))
+
+        all_scores = np.empty(n_pairs, dtype=np.float32)
         batch_starts = range(0, n_pairs, self.batch_size)
         iterator = batch_starts
-        if show_progress and n_pairs > 0:
+        if show_progress:
             iterator = tqdm(
                 batch_starts,
                 desc=desc,
@@ -248,14 +263,19 @@ class WrappedRerankerModel(nn.Module):
             )
         for start in iterator:
             end = min(start + self.batch_size, n_pairs)
-            tokenized = [
-                tokenize_pair(q, d, self.tokenizer, self.max_length, self.instruction)
-                for q, d in zip(query_texts[start:end], doc_texts[start:end])
-            ]
-            padded = self.tokenizer.pad(tokenized, padding="max_length", max_length=self.max_length, return_tensors="pt")
+            batch_idx = order[start:end]
+            tokenized = [tokenized_all[k] for k in batch_idx]
+            # Dynamic padding to the batch's longest sequence (capped at max_length
+            # by tokenize_pair's truncation). With left padding + attention mask the
+            # P(yes) logit is read from the last real token, so this is numerically
+            # identical to padding="max_length" but avoids paying for 512 tokens on
+            # short pairs. pad_to_multiple_of=8 keeps tensor-core/flash-attn alignment.
+            padded = self.tokenizer.pad(
+                tokenized, padding="longest", pad_to_multiple_of=8, return_tensors="pt",
+            )
             scores = self.score(padded["input_ids"], padded["attention_mask"])
-            all_scores.append(scores.numpy())
-        return np.concatenate(all_scores, axis=0)
+            all_scores[batch_idx] = scores.numpy()
+        return all_scores
 
     @torch.no_grad()
     def score_matrix(

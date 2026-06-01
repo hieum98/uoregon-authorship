@@ -1,6 +1,6 @@
 seed: 888
 num_workers: 16
-run_name: reranker-v6
+run_name: reranker-v10
 
 data:
   dataset_names:
@@ -34,21 +34,34 @@ data:
     - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/u-sticker_hard
     - /gpfs/projects/uonlp/hieum/uoregon-authorship/data/yt_comments_hard
   languages: [en, zh, ru, ar, de, es, fr]
-  global_batch_size: 64
+  # Per-device forward = (global_batch_size / devices) * pairs_per_query.
+  # pairs_per_query = num_pos + num_neg = 3 + 12 = 15 (was 6 at v9).
+  # 24/4 * 15 = 90 seqs/forward ~= v9's 64/4 * 6 = 96, so it fits the same GPU mem.
+  # grad-accum still 8 -> 24*15*8 = 2880 pairs/update ~= v9's 64*6*8 = 3072.
+  global_batch_size: 24
   max_seq_length: 512
-  num_train_examples: 100000
-  num_pos_per_query: 2
-  num_neg_per_query: 2
+  num_train_examples: 20000
+  num_pos_per_query: 3    # 1 random (easy/high-sim) + 1 med + 1 hard (most dissimilar) same-author
+  num_neg_per_query: 12   # 3-way (random + close-to-query + close-to-positive); 1:4 pos:neg
+  # Paper-style negative mix (arXiv:2510.16819), curriculum over epochs:
+  #   random  = n(r):   random different-author docs
+  #   hard_q  = n(dq):  closest different-author docs to the QUERY  (hard_negative_docIDs)
+  #   pos_med = n(dq+): closest different-author docs to the MED positive
+  #   pos_hard= n(dq+): closest different-author docs to the HARD positive
+  # n(dq+) reuses each positive doc's own hard_negative_docIDs (finetuned-embedder mined).
   negative_curriculum:
-    - easy: 1
-      semihard: 1
-      hard: 0
-    - easy: 0
-      semihard: 2
-      hard: 0
-    - easy: 0
-      semihard: 0
-      hard: 2
+    - random: 8     # easy stage: mostly random + query-close
+      hard_q: 4
+      pos_med: 0
+      pos_hard: 0
+    - random: 4     # med stage: introduce negatives close to the medium positive
+      hard_q: 4
+      pos_med: 4
+      pos_hard: 0
+    - random: 4     # hard stage: negatives close to the hardest positive
+      hard_q: 4
+      pos_med: 0
+      pos_hard: 4
   instruction: null
 
 model:
@@ -64,7 +77,7 @@ model:
     name: default
 
 training:
-  output_dir: outputs/reranker-v6
+  output_dir: outputs/reranker-v10
   devices: 4
   precision: bf16-mixed
   epochs: 3
@@ -74,8 +87,13 @@ training:
   min_reduce_rate: 0.05
   grad_clip: 1.0
   label_smoothing: 0.05
+  pos_weight: 4.0   # balance 1:4 pos:neg in BCE (num_neg/num_pos); keeps P(yes) centered
+  ranking_loss_weight: 0.2
+  ranking_margin: 0.0
   gradient_accumulation_steps: 8
   checkpoint_interval: 2000
+  checkpoint_save_optimizer: false
+  checkpoint_save_scheduler: false
   logger:
     type: wandb
     project: authorship-reranker
