@@ -1,6 +1,7 @@
-seed: 888
+seed: 1337     # v11 uses a fresh seed so the 20k-query subsample is disjoint
+               # from what v10 had already trained on by step18000.
 num_workers: 16
-run_name: reranker-v10
+run_name: reranker-v11
 
 data:
   dataset_names:
@@ -51,18 +52,30 @@ data:
   # n(dq+) reuses each positive doc's own hard_negative_docIDs (finetuned-embedder mined).
   negative_curriculum:
     - random: 8     # easy stage: mostly random + query-close
-      hard_q: 4
-      pos_med: 0
-      pos_hard: 0
-    - random: 4     # med stage: introduce negatives close to the medium positive
-      hard_q: 4
+      hard_q: 0
       pos_med: 4
       pos_hard: 0
-    - random: 4     # hard stage: negatives close to the hardest positive
-      hard_q: 4
+    - random: 8     # med stage: introduce negatives close to the medium positive
+      hard_q: 1
+      pos_med: 2
+      pos_hard: 1
+    - random: 8     # hard stage: negatives close to the hardest positive
+      hard_q: 2
       pos_med: 0
-      pos_hard: 4
+      pos_hard: 2
   instruction: null
+  #   - random: 10     # easy stage: mostly random + query-close
+  #     hard_q: 0
+  #     pos_med: 2
+  #     pos_hard: 0
+  #   - random: 10     # med stage: introduce negatives close to the medium positive
+  #     hard_q: 1
+  #     pos_med: 1
+  #     pos_hard: 0
+  #   - random: 10     # hard stage: negatives close to the hardest positive
+  #     hard_q: 1
+  #     pos_med: 0
+  #     pos_hard: 1
 
 model:
   model_name_or_path: Qwen/Qwen3-4B
@@ -77,19 +90,31 @@ model:
     name: default
 
 training:
-  output_dir: outputs/reranker-v10
+  output_dir: outputs/reranker-v11
   devices: 4
   precision: bf16-mixed
+  # From-scratch v11 (no warm-start) after v11-warm diagnostic showed the v10
+  # warm-start carried the inverted-similarity prior. 3 epochs so all curriculum
+  # stages activate (stage 0 = easy, stage 1 = +hard_q, stage 2 = +pos_hard).
+  # model_resume_from: outputs/reranker-v10/checkpoint_step18000.ckpt
   epochs: 3
   lr: 5.0e-6
   weight_decay: 0.1
-  warmup_steps: 200
+  warmup_steps: 500                 # ~1% of total steps for from-scratch stability
   min_reduce_rate: 0.05
   grad_clip: 1.0
   label_smoothing: 0.05
-  pos_weight: 4.0   # balance 1:4 pos:neg in BCE (num_neg/num_pos); keeps P(yes) centered
-  ranking_loss_weight: 0.2
+  # Loss mix: BCE (calibration anchor for EER + cos/P(yes) interpolation)
+  # + listwise softmax-CE (within-query ranking signal aligned with S@k).
+  # pos_weight stays at 1.0: listwise handles the 1:4 pos:neg imbalance
+  # natively, so the pointwise pos-class upweight is no longer needed.
+  pos_weight: 1.0
+  ranking_loss_weight: 0.0          # pairwise hinge subsumed by listwise
   ranking_margin: 0.0
+  listwise_loss_weight: 1.0         # ListNet top-1 over each query group
+  listwise_temperature: 2.0         # softer softmax: spread gradient across all
+                                    # negatives instead of crushing the largest one,
+                                    # so BCE absolute-magnitude calibration survives.
   gradient_accumulation_steps: 8
   checkpoint_interval: 2000
   checkpoint_save_optimizer: false
@@ -100,17 +125,17 @@ training:
 
 evaluation:
   genres:
-    - HRS2.1
-    - HRS2.2
-    - HRS2.3
-    - HRS2.4
-    - HRS2.5
+    # - HRS2.1
+    # - HRS2.2
+    # - HRS2.3
+    # - HRS2.4
+    # - HRS2.5
     - en_cross_genre_medium
-    - HRS2.101
-    - HRS2.102
-    - HRS2.103
-    - HRS2.104
-    - HRS2.105
+    # - HRS2.101
+    # - HRS2.102
+    # - HRS2.103
+    # - HRS2.104
+    # - HRS2.105
     - ru_cross_genre_long
     - ru_cross_genre_medium
     - HRS3.1
@@ -119,11 +144,11 @@ evaluation:
     - HRS3.4
     - HRS3.5
     - en_cross_genre_short
-    - HRS3.301
-    - HRS3.302
-    - HRS3.303
-    - HRS3.304
-    - HRS3.305
+    # - HRS3.301
+    # - HRS3.302
+    # - HRS3.303
+    # - HRS3.304
+    # - HRS3.305
     - zh_cross_genre_medium
     - zh_cross_genre_short
   batch_size: 32

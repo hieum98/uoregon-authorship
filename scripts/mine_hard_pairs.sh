@@ -14,6 +14,9 @@
 # All arguments are optional; defaults are shown below. Tunables can also be
 # overridden via env vars of the same name.
 #
+# Use a HuggingFace embedder instead of a trained authorship checkpoint:
+#   HF_EMBEDDER_MODEL=Qwen/Qwen3-Embedding-0.6B bash scripts/mine_hard_pairs.sh
+#
 # Examples:
 #   # Single GPU, default embedder checkpoint
 #   bash scripts/mine_hard_pairs.sh
@@ -21,6 +24,10 @@
 #   # 4 GPUs, custom dataset and output
 #   bash scripts/mine_hard_pairs.sh Hieuman/reddit_bm25 ./data/reddit_hard 'en' \
 #       512 50 outputs/merged-4B.v4-eer-wins ./data/embeddings 4
+#
+#   # HF Qwen3-Embedding-0.6B (single GPU)
+#   HF_EMBEDDER_MODEL=Qwen/Qwen3-Embedding-0.6B \
+#       bash scripts/mine_hard_pairs.sh Hieuman/reddit_bm25 ./data/reddit_hard_qwen en
 #
 #   # Larger over-fetch buffer for prolific-author corpora
 #   NEG_BUFFER=16 bash scripts/mine_hard_pairs.sh
@@ -38,6 +45,20 @@ NUM_GPUS="${8:-${NUM_GPUS:-1}}"
 NLIST="${9:-${NLIST:-65536}}"                # auto-clamped to N//39 inside the script
 NPROBE="${10:-${NPROBE:-128}}"
 NEG_BUFFER="${11:-${NEG_BUFFER:-4}}"         # fetch_k = TOP_K_NEG * NEG_BUFFER
+HF_EMBEDDER_MODEL="${HF_EMBEDDER_MODEL:-}"
+HF_EMBEDDER_INSTRUCT="${HF_EMBEDDER_INSTRUCT:-}"
+HF_EMBEDDER_ATTN="${HF_EMBEDDER_ATTN:-}"
+
+EMBEDDER_ARGS=(--embedder-config-dir "${EMBEDDER_CONFIG_DIR}")
+if [[ -n "${HF_EMBEDDER_MODEL}" ]]; then
+    EMBEDDER_ARGS=(--hf-embedder-model "${HF_EMBEDDER_MODEL}")
+    if [[ -n "${HF_EMBEDDER_INSTRUCT}" ]]; then
+        EMBEDDER_ARGS+=(--hf-embedder-instruct "${HF_EMBEDDER_INSTRUCT}")
+    fi
+    if [[ -n "${HF_EMBEDDER_ATTN}" ]]; then
+        EMBEDDER_ARGS+=(--hf-embedder-attn "${HF_EMBEDDER_ATTN}")
+    fi
+fi
 
 echo "=========================================="
 echo " Dense Hard-Pair Mining"
@@ -47,7 +68,11 @@ echo "  Output dir      : ${OUTPUT_DIR}"
 echo "  Languages       : ${LANGUAGES}"
 echo "  Top-K negatives : ${TOP_K_NEG}"
 echo "  Top-K positives : ${TOP_K_POS}"
+if [[ -n "${HF_EMBEDDER_MODEL}" ]]; then
+echo "  HF embedder     : ${HF_EMBEDDER_MODEL}"
+else
 echo "  Embedder config : ${EMBEDDER_CONFIG_DIR}"
+fi
 echo "  Embedding cache : ${EMBEDDING_DIR}"
 echo "  GPUs            : ${NUM_GPUS}"
 echo "  FAISS nlist     : ${NLIST}"
@@ -65,7 +90,7 @@ PYTHONUNBUFFERED=1 conda run --no-capture-output -n hiatus-phase3 \
             --dataset-name "${DATASET_NAME}" \
             --output-dir "${OUTPUT_DIR}" \
             --languages ${LANGUAGES} \
-            --embedder-config-dir "${EMBEDDER_CONFIG_DIR}" \
+            "${EMBEDDER_ARGS[@]}" \
             --top-k-neg "${TOP_K_NEG}" \
             --top-k-pos "${TOP_K_POS}" \
             --embedding-dir "${EMBEDDING_DIR}" \

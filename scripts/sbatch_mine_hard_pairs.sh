@@ -7,12 +7,13 @@
 #
 # Overrides (env vars):
 #   EMBEDDER_CONFIG_DIR=outputs/my-model sbatch scripts/sbatch_mine_hard_pairs.sh
+#   HF_EMBEDDER_MODEL=Qwen/Qwen3-Embedding-0.6B sbatch scripts/sbatch_mine_hard_pairs.sh
 
 #SBATCH --job-name=mine_pairs
 #SBATCH --array=0-22%6
 #SBATCH --partition=preempt,gpulong,cisds
 #SBATCH --gres=gpu:4
-#SBATCH --constraint="gpu-80gb|gpu-40gb"
+#SBATCH --constraint="gpu-80gb"
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --output=logs/mine_%A_%a.log
@@ -23,47 +24,52 @@ set -euo pipefail
 mkdir -p logs
 
 DATASETS=(
-    # "Hieuman/ru_KP" x
-    # "Hieuman/hiatus-imdb" x 
-    # "Hieuman/ru_STX" x
-    # "Hieuman/MUD" x
-    # "Hieuman/movie_reviews" x
-    # "Hieuman/blog_authorship" x
-    # "Hieuman/stihi_ru" x
-    # "Hieuman/goodreads" x
-    # "Hieuman/yelp_review" x
-    # "Hieuman/proza_ru" x
-    # "Hieuman/u-sticker" x
-    # "Hieuman/ru_reddit_dump" x
-    # "Hieuman/ru_telegram" x
-    # "Hieuman/douban_reviews" x
+    # "Hieuman/ru_KP" 
+    # "Hieuman/hiatus-imdb" 
+    # "Hieuman/ru_STX" 
+    # "Hieuman/movie_reviews" 
+    # "Hieuman/blog_authorship" 
+    # "Hieuman/stihi_ru" 
+    # "Hieuman/goodreads" 
+    # "Hieuman/yelp_review" 
+    # "Hieuman/proza_ru" 
+    # "Hieuman/u-sticker" 
+    # "Hieuman/ru_reddit_dump" 
+    # "Hieuman/ru_telegram" 
+    # "Hieuman/douban_reviews" 
     
-    # "Hieuman/STX" x
-    # "Hieuman/weibo_full" x
-    # "Hieuman/dianping_review" x
-    # "Hieuman/wiki_en_small" x
-    # "Hieuman/HNI" x
-    # "Hieuman/wiki_ru" x
-    # "Hieuman/nyt_comments" x
-    # "Hieuman/jd_reviews" x
-    # "Hieuman/yt_comments" x
-    # "Hieuman/reddit_dump" x
-    # "Hieuman/exorde" x
-    # "Hieuman/amazon_reviews" x
+    "Hieuman/MUD" 
+    "Hieuman/STX" 
+    "Hieuman/weibo_full" 
+    "Hieuman/dianping_review" 
+    "Hieuman/wiki_en_small" 
+    "Hieuman/HNI" 
+    "Hieuman/wiki_ru" 
+    "Hieuman/nyt_comments" 
+    "Hieuman/jd_reviews" 
+    "Hieuman/yt_comments" 
+    "Hieuman/reddit_dump" 
+    "Hieuman/exorde" 
+    "Hieuman/amazon_reviews" 
 )
 
 DATASET="${DATASETS[$SLURM_ARRAY_TASK_ID]}"
 NAME="${DATASET#Hieuman/}"
-OUTPUT_DIR="${OUT_ROOT:-./data}/${NAME}_hard"
+OUTPUT_DIR="${OUT_ROOT:-./data-topics}/${NAME}_hard"
 EMBEDDER_CONFIG_DIR="${EMBEDDER_CONFIG_DIR:-outputs/merged-4B.v4-eer-wins}"
-EMBEDDING_DIR="${EMBEDDING_DIR:-./data/embeddings}"
+HF_EMBEDDER_MODEL="${HF_EMBEDDER_MODEL:-}"
+EMBEDDING_DIR="${EMBEDDING_DIR:-./data-topics/embeddings}"
 NUM_GPUS=4
 
 echo "========================================"
 echo "  Task          : ${SLURM_ARRAY_TASK_ID}"
 echo "  Dataset       : ${DATASET}"
 echo "  Output        : ${OUTPUT_DIR}"
+if [[ -n "${HF_EMBEDDER_MODEL}" ]]; then
+echo "  HF embedder   : ${HF_EMBEDDER_MODEL}"
+else
 echo "  Embedder      : ${EMBEDDER_CONFIG_DIR}"
+fi
 echo "  Embedding dir : ${EMBEDDING_DIR}"
 echo "  Node          : $(hostname)"
 echo "  GPUs          : $(echo $CUDA_VISIBLE_DEVICES)"

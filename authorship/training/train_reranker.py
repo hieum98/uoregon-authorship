@@ -61,6 +61,8 @@ def train_step(
     label_smoothing: float = 0.0,
     ranking_loss_weight: float = 0.0,
     ranking_margin: float = 0.0,
+    listwise_loss_weight: float = 0.0,
+    listwise_temperature: float = 1.0,
     pos_weight: float = 1.0,
 ):
     outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
@@ -70,6 +72,8 @@ def train_step(
         group_ids=batch.get("group_ids"),
         ranking_loss_weight=ranking_loss_weight,
         ranking_margin=ranking_margin,
+        listwise_loss_weight=listwise_loss_weight,
+        listwise_temperature=listwise_temperature,
         pos_weight=pos_weight,
     )
     return loss, outputs
@@ -85,6 +89,8 @@ def fit_epoch(
     label_smoothing = config.training.get("label_smoothing", 0.0)
     ranking_loss_weight = config.training.get("ranking_loss_weight", 0.0)
     ranking_margin = config.training.get("ranking_margin", 0.0)
+    listwise_loss_weight = config.training.get("listwise_loss_weight", 0.0)
+    listwise_temperature = config.training.get("listwise_temperature", 1.0)
     pos_weight = config.training.get("pos_weight", 1.0)
     model.train()
     for batch_idx, batch in enumerate(train_loader):
@@ -96,6 +102,8 @@ def fit_epoch(
             label_smoothing=label_smoothing,
             ranking_loss_weight=ranking_loss_weight,
             ranking_margin=ranking_margin,
+            listwise_loss_weight=listwise_loss_weight,
+            listwise_temperature=listwise_temperature,
             pos_weight=pos_weight,
         )
         fabric.backward(loss / grad_accum)
@@ -213,6 +221,8 @@ def main(fabric, config):
         f"  min_lr:                 {config.training.lr * config.training.get('min_reduce_rate', 0.0):.2e}\n"
         f"  ranking_loss_weight:    {config.training.get('ranking_loss_weight', 0.0)}\n"
         f"  ranking_margin:         {config.training.get('ranking_margin', 0.0)}\n"
+        f"  listwise_loss_weight:   {config.training.get('listwise_loss_weight', 0.0)}\n"
+        f"  listwise_temperature:   {config.training.get('listwise_temperature', 1.0)}\n"
         f"  pos_weight:             {config.training.get('pos_weight', 1.0)}\n"
         f"  negative curriculum:    {config.data.get('negative_curriculum')}\n"
         f"{'='*60}\n"
@@ -222,11 +232,23 @@ def main(fabric, config):
         optimizer,
         num_warmup_steps=config.training.get("warmup_steps", 100),
         num_training_steps=total_optimizer_steps,
-        num_cycles=config.training.get("epochs", 5),
+        num_cycles=1,# config.training.get("epochs", 5),
         min_reduce_rate=config.training.get("min_reduce_rate", 0.0),
     )
 
     model, optimizer = fabric.setup(model, optimizer)
+
+    # Optional warm-start: load model weights from a prior FSDP checkpoint
+    # (saved via fabric.save). Optimizer / scheduler are NOT restored so the
+    # LR schedule starts fresh (warmup -> peak -> cosine).
+    resume_path = config.training.get("model_resume_from")
+    if resume_path:
+        resume_path = pathlib.Path(resume_path)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"model_resume_from not found: {resume_path}")
+        fabric.print(f"Warm-starting model weights from: {resume_path}")
+        fabric.load(resume_path, {"model": model})
+        fabric.print("Warm-start load complete.")
 
     for epoch in range(config.training.get("epochs", 5)):
         data_module.set_epoch(epoch)

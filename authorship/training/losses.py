@@ -38,17 +38,22 @@ def compute_reranker_loss(
     group_ids: torch.Tensor | None = None,
     ranking_loss_weight: float = 0.0,
     ranking_margin: float = 0.0,
+    listwise_loss_weight: float = 0.0,
+    listwise_temperature: float = 1.0,
     pos_weight: float = 1.0,
 ) -> torch.Tensor:
-    """BCE loss plus optional within-query pairwise ranking loss.
+    """BCE plus optional within-query pairwise and listwise ranking terms.
 
     Uses binary_cross_entropy_with_logits on (true - false) logit difference,
-    which is equivalent to softmax-over-2 + BCE but numerically stable for
-    extreme logit values via the log-sum-exp trick.
+    which is equivalent to softmax-over-2 + BCE but numerically stable.
 
-    ``pos_weight`` scales the positive-class term of the BCE; set it to
-    ``num_neg / num_pos`` to counteract a pos:neg imbalance (e.g. 4.0 for a
-    3:12 pos:neg sampling) and keep the operating point centered.
+    BCE provides cross-query calibration (anchors P(yes) for EER and the
+    score interpolation in AuthorshipModel.reranker()). The listwise term
+    (ListNet-style multi-positive softmax CE over each group) provides the
+    within-query ranking signal aligned with S@k.
+
+    ``pos_weight`` scales the positive-class term of the BCE; leave at 1.0
+    when the listwise term is active (listwise handles imbalance natively).
     """
     logit_diff = true_logits - false_logits  # log-odds = log P(yes)/P(no)
     target_labels = labels
@@ -62,16 +67,20 @@ def compute_reranker_loss(
     bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(
         logit_diff, target_labels.to(logit_diff.device), pos_weight=pw
     )
-    if ranking_loss_weight <= 0 or group_ids is None:
-        return bce_loss
+    total = bce_loss
 
-    ranking_loss = compute_pairwise_ranking_loss(
-        logit_diff,
-        labels.to(logit_diff.device),
-        group_ids.to(logit_diff.device),
-        margin=ranking_margin,
-    )
-    return bce_loss + ranking_loss_weight * ranking_loss
+    if group_ids is not None:
+        gids = group_ids.to(logit_diff.device)
+        lbls = labels.to(logit_diff.device)
+        if ranking_loss_weight > 0:
+            total = total + ranking_loss_weight * compute_pairwise_ranking_loss(
+                logit_diff, lbls, gids, margin=ranking_margin,
+            )
+        if listwise_loss_weight > 0:
+            total = total + listwise_loss_weight * compute_listwise_loss(
+                logit_diff, lbls, gids, temperature=listwise_temperature,
+            )
+    return total
 
 
 def compute_pairwise_ranking_loss(
@@ -92,6 +101,35 @@ def compute_pairwise_ranking_loss(
             continue
         deltas = pos_scores[:, None] - neg_scores[None, :]
         losses.append(torch.nn.functional.softplus(margin - deltas).mean())
+    if not losses:
+        return scores.new_zeros(())
+    return torch.stack(losses).mean()
+
+
+def compute_listwise_loss(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    group_ids: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Per-group multi-positive softmax cross-entropy (ListNet top-1).
+
+    For each query group, the target distribution is uniform over the
+    positives; the loss is cross-entropy (equivalently KL up to a constant)
+    between that target and softmax(scores / temperature). Lower temperature
+    sharpens focus on the hardest negative; higher smooths the gradient.
+    """
+    losses = []
+    for group_id in torch.unique(group_ids):
+        mask = group_ids == group_id
+        s = scores[mask] / temperature
+        y = labels[mask].to(s.dtype)
+        n_pos = y.sum()
+        if n_pos == 0 or n_pos == y.numel():
+            continue  # need at least one positive AND one negative
+        target = y / n_pos
+        log_p = torch.log_softmax(s, dim=0)
+        losses.append(-(target * log_p).sum())
     if not losses:
         return scores.new_zeros(())
     return torch.stack(losses).mean()
@@ -134,17 +172,13 @@ def compute_reranker_metrics(
         "p_yes_gap": avg_p_yes_pos - avg_p_yes_neg,
     }
     if group_ids is not None:
-        ranking_loss = compute_pairwise_ranking_loss(
-            logit_diff,
-            labels.to(logit_diff.device),
-            group_ids.to(logit_diff.device),
-        )
+        gids = group_ids.to(logit_diff.device)
+        lbls = labels.to(logit_diff.device)
+        ranking_loss = compute_pairwise_ranking_loss(logit_diff, lbls, gids)
+        listwise_loss = compute_listwise_loss(logit_diff, lbls, gids, temperature=1.0)
         metrics["ranking_loss"] = ranking_loss.item()
-        metrics["pairwise_accuracy"] = compute_pairwise_accuracy(
-            logit_diff,
-            labels.to(logit_diff.device),
-            group_ids.to(logit_diff.device),
-        )
+        metrics["listwise_loss"] = listwise_loss.item()
+        metrics["pairwise_accuracy"] = compute_pairwise_accuracy(logit_diff, lbls, gids)
     return metrics
 
 

@@ -40,8 +40,8 @@ LOG_FILE="${LOG_FILE:-$EVAL_DIR/eval.log}"
 
 # top_k=256 widens the reranker window so retriever recall@top_k → ~100%,
 # which keeps the shift+normalize fix from creating an EER floor.
-TOP_K="${TOP_K:-256}"
-RERANKER_WEIGHT="${RERANKER_WEIGHT:-0.1}"
+TOP_K="${TOP_K:-64}"
+RERANKER_WEIGHT="${RERANKER_WEIGHT:-0.25}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 MAX_LENGTH="${MAX_LENGTH:-512}"
 # TA2 doc-pair -> author aggregation: max | mean | topk_mean

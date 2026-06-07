@@ -28,7 +28,7 @@ All intermediate files are written to ``--embedding-dir``. Completed phases
 are detected by the presence of their output files, so interrupted runs can
 be resumed cheaply.
 
-Usage (multi-GPU via torchrun):
+Usage (multi-GPU via torchrun, trained authorship embedder):
     torchrun --nproc-per-node=4 \\
         -m authorship.preprocessing.embedder_mining \\
         --dataset-name Hieuman/reddit_bm25 \\
@@ -36,12 +36,12 @@ Usage (multi-GPU via torchrun):
         --languages en \\
         --embedder-config-dir outputs/merged-4B.v4-eer-wins
 
-Usage (single GPU):
+Usage (HF embedder, e.g. Qwen3-Embedding-0.6B):
     python -m authorship.preprocessing.embedder_mining \\
         --dataset-name Hieuman/reddit_bm25 \\
         --output-dir ./data/reddit_hard_pairs \\
         --languages en \\
-        --embedder-config-dir outputs/merged-4B.v4-eer-wins
+        --hf-embedder-model Qwen/Qwen3-Embedding-0.6B
 
 See ``scripts/mine_hard_pairs.sh`` for a convenience wrapper.
 """
@@ -52,7 +52,7 @@ import os
 import pickle
 from datetime import timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Protocol, Tuple, Union
 
 import datasets
 import numpy as np
@@ -63,7 +63,16 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from authorship.models.embedder import WrappedEmbeddingModel
+from authorship.models.hf_embedder import HFEmbeddingModel
 from authorship.preprocessing.bm25_mining import add_column_with_polars, build_same_author_ids
+
+
+class EmbeddingEncoder(Protocol):
+    def encode(
+        self,
+        sentences: Union[List[str], str],
+        max_length: int = 512,
+    ) -> torch.Tensor: ...
 
 
 # ---------------------------------------------------------------------------
@@ -164,12 +173,25 @@ def load_embedder(
     )
 
 
+def load_hf_embedder(
+    model_name_or_path: str,
+    instruct: Optional[str] = None,
+    attn_implementation: Optional[str] = None,
+) -> HFEmbeddingModel:
+    """Load a HuggingFace-native embedding model (no projection head)."""
+    return HFEmbeddingModel(
+        model_name_or_path=model_name_or_path,
+        instruct=instruct,
+        attn_implementation=attn_implementation,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 — Encode
 # ---------------------------------------------------------------------------
 
 def encode_shard(
-    model: WrappedEmbeddingModel,
+    model: EmbeddingEncoder,
     texts: List[str],
     doc_ids: List[int],
     shard_path: str,
@@ -472,7 +494,7 @@ def mine_pairs_for_shard(
 def process_language_split(
     dataset: datasets.Dataset,
     lang: str,
-    model: WrappedEmbeddingModel,
+    model: EmbeddingEncoder,
     embedding_dir: str,
     top_k_neg: int,
     top_k_pos: int,
@@ -655,11 +677,26 @@ def main() -> None:
     )
     parser.add_argument(
         "--embedder-config-dir", type=str, default="outputs/merged-4B.v4-eer-wins",
-        help="Directory containing config.yaml and the embedder checkpoint",
+        help="Directory containing config.yaml and the embedder checkpoint "
+             "(ignored when --hf-embedder-model is set)",
     )
     parser.add_argument(
         "--embedder-checkpoint-path", type=str, default=None,
         help="Explicit checkpoint path; overrides auto-detection from config dir",
+    )
+    parser.add_argument(
+        "--hf-embedder-model", type=str, default=None,
+        help="HF model ID or local path for native embedding models "
+             "(e.g. Qwen/Qwen3-Embedding-0.6B). Skips the authorship projection head.",
+    )
+    parser.add_argument(
+        "--hf-embedder-instruct", type=str, default=None,
+        help="Optional Qwen3-style task instruction prepended to each document. "
+             "Leave unset for symmetric document-to-document encoding.",
+    )
+    parser.add_argument(
+        "--hf-embedder-attn", type=str, default=None,
+        help="Attention implementation for HF embedder (e.g. flash_attention_2)",
     )
     parser.add_argument(
         "--top-k-neg", type=int, default=512,
@@ -708,8 +745,22 @@ def main() -> None:
         os.makedirs(args.output_dir, exist_ok=True)
     barrier()
 
-    print(f"[Rank {rank}/{world_size}] Loading embedder from {args.embedder_config_dir!r} …", flush=True)
-    model = load_embedder(args.embedder_config_dir, args.embedder_checkpoint_path)
+    if args.hf_embedder_model:
+        print(
+            f"[Rank {rank}/{world_size}] Loading HF embedder {args.hf_embedder_model!r} …",
+            flush=True,
+        )
+        model = load_hf_embedder(
+            args.hf_embedder_model,
+            instruct=args.hf_embedder_instruct,
+            attn_implementation=args.hf_embedder_attn,
+        )
+    else:
+        print(
+            f"[Rank {rank}/{world_size}] Loading embedder from {args.embedder_config_dir!r} …",
+            flush=True,
+        )
+        model = load_embedder(args.embedder_config_dir, args.embedder_checkpoint_path)
 
     if os.path.exists(args.dataset_name):
         hf_data = datasets.load_from_disk(args.dataset_name)
