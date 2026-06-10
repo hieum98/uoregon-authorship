@@ -29,9 +29,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 EMBEDDER_DIR="${EMBEDDER_DIR:-outputs/merged-8B.v3-s8-wins}"
-RERANKER_DIR="${RERANKER_DIR:-outputs/reranker-v10}"
-CKPT="${CKPT:-$RERANKER_DIR/exported/checkpoint_step18000.pt}"
-WEIGHTS="${WEIGHTS:-0.25 0.5 0.75 1.0}"
+RERANKER_DIR="${RERANKER_DIR:-outputs/reranker-v11}"
+CKPT="${CKPT:-$RERANKER_DIR/exported/checkpoint_step10000.pt}"
+WEIGHTS="${WEIGHTS:-0.05 0.1 0.5 0.75 1.0}"
 
 CKPT_STEM="$(basename "$CKPT" .pt)"
 SWEEP_DIR="${SWEEP_DIR:-$RERANKER_DIR/hrs_eval_weight_sweep/${CKPT_STEM}}"

@@ -1,7 +1,7 @@
 seed: 1337     # v11 uses a fresh seed so the 20k-query subsample is disjoint
                # from what v10 had already trained on by step18000.
 num_workers: 16
-run_name: reranker-v11
+run_name: reranker-v12
 
 data:
   dataset_names:
@@ -64,18 +64,6 @@ data:
       pos_med: 0
       pos_hard: 2
   instruction: null
-  #   - random: 10     # easy stage: mostly random + query-close
-  #     hard_q: 0
-  #     pos_med: 2
-  #     pos_hard: 0
-  #   - random: 10     # med stage: introduce negatives close to the medium positive
-  #     hard_q: 1
-  #     pos_med: 1
-  #     pos_hard: 0
-  #   - random: 10     # hard stage: negatives close to the hardest positive
-  #     hard_q: 1
-  #     pos_med: 0
-  #     pos_hard: 1
 
 model:
   model_name_or_path: Qwen/Qwen3-4B
@@ -90,7 +78,7 @@ model:
     name: default
 
 training:
-  output_dir: outputs/reranker-v11
+  output_dir: outputs/reranker-v12
   devices: 4
   precision: bf16-mixed
   # From-scratch v11 (no warm-start) after v11-warm diagnostic showed the v10
@@ -104,17 +92,19 @@ training:
   min_reduce_rate: 0.05
   grad_clip: 1.0
   label_smoothing: 0.05
-  # Loss mix: BCE (calibration anchor for EER + cos/P(yes) interpolation)
-  # + listwise softmax-CE (within-query ranking signal aligned with S@k).
-  # pos_weight stays at 1.0: listwise handles the 1:4 pos:neg imbalance
-  # natively, so the pointwise pos-class upweight is no longer needed.
-  pos_weight: 1.0
+  # Loss mix tuned from v11 wandb diagnosis:
+  # - v11 at listwise=1.0 had listwise_loss ~2.5 vs BCE ~0.4 (listwise 6x larger).
+  #   Result: avg_p_yes_pos stuck <0.5 -> low recall, eval needed w=0.05 to be
+  #   net-positive because reranker logit magnitudes drowned the embedder cos.
+  # - listwise=0.2 brings BCE and listwise to gradient parity so BCE can re-anchor
+  #   absolute magnitudes, restoring the normal w=0.25-0.5 interpolation regime.
+  # - pos_weight=2.0 compensates the 1:4 pos:neg imbalance now that BCE matters
+  #   again; should lift recall from ~0.25 toward 0.5+.
+  pos_weight: 2.0
   ranking_loss_weight: 0.0          # pairwise hinge subsumed by listwise
   ranking_margin: 0.0
-  listwise_loss_weight: 1.0         # ListNet top-1 over each query group
-  listwise_temperature: 2.0         # softer softmax: spread gradient across all
-                                    # negatives instead of crushing the largest one,
-                                    # so BCE absolute-magnitude calibration survives.
+  listwise_loss_weight: 0.2         # was 1.0; gradient parity with BCE per v11 diagnosis
+  listwise_temperature: 2.0         # unchanged; v11 data showed no logit crushing
   gradient_accumulation_steps: 8
   checkpoint_interval: 2000
   checkpoint_save_optimizer: false

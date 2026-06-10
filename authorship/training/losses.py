@@ -179,6 +179,8 @@ def compute_reranker_metrics(
         metrics["ranking_loss"] = ranking_loss.item()
         metrics["listwise_loss"] = listwise_loss.item()
         metrics["pairwise_accuracy"] = compute_pairwise_accuracy(logit_diff, lbls, gids)
+        metrics["rank1_acc"] = compute_rankk_accuracy(logit_diff, lbls, gids, k=1)
+        metrics["rank3_acc"] = compute_rankk_accuracy(logit_diff, lbls, gids, k=3)
     return metrics
 
 
@@ -201,3 +203,29 @@ def compute_pairwise_accuracy(
     if not correct:
         return 0.0
     return torch.stack(correct).mean().item()
+
+
+def compute_rankk_accuracy(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    group_ids: torch.Tensor,
+    k: int = 1,
+) -> float:
+    """Fraction of query groups where at least one positive ranks in top-k by score.
+
+    Aligns with the S@k eval objective: per-group hit rate when the reranker
+    pushes a same-author candidate into the top-k of its candidate list.
+    """
+    hits = []
+    for group_id in torch.unique(group_ids):
+        mask = group_ids == group_id
+        group_scores = scores[mask]
+        group_labels = labels[mask]
+        if (group_labels == 1).sum() == 0 or (group_labels == 0).sum() == 0:
+            continue
+        kk = min(k, group_scores.numel())
+        topk_idx = torch.topk(group_scores, kk).indices
+        hits.append((group_labels[topk_idx] == 1).any().float())
+    if not hits:
+        return 0.0
+    return torch.stack(hits).mean().item()
