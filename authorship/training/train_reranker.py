@@ -301,6 +301,7 @@ def setup(config: DictConfig):
     fabric = L.Fabric(
         accelerator="auto",
         devices=config.training.get("devices", 1),
+        # num_nodes=config.training.get("num_nodes", 1),
         precision=config.training.get("precision", "bf16-mixed"),
         strategy=strategy,
         loggers=[logger],

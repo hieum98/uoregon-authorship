@@ -1,7 +1,8 @@
 """HRS evaluation data path constants.
 """
 
-HRS_DIR = '/home/hieum/uonlp/hiatus_main/HRS'
+# HRS_DIR = '/home/hieum/uonlp/hiatus_main/HRS'
+HRS_DIR = '/gpfs/home/cuongp/hiatus-libs/HRS'
 PERFORMER_CONFIG_PATH = 'TA2-performer-config.yaml'
 
 HRS1_DIR = '/home/hieum/uonlp/avae/data/HRS/TA1'
