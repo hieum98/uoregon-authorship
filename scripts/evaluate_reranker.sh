@@ -8,7 +8,6 @@
 #     runs one checkpoint per GPU in parallel (work-stealing pool).
 #
 # Usage:
-#   cd /home/hieum/uonlp/uoregon-authorship
 #   bash scripts/evaluate_reranker.sh                 # export (if needed) + eval all (parallel over all GPUs)
 #   bash scripts/evaluate_reranker.sh --skip-export   # eval only (exported .pt must exist)
 #   bash scripts/evaluate_reranker.sh --export-only   # export only

@@ -1,11 +1,17 @@
 """HRS evaluation data path constants.
+
+HRS (HIATUS Research Set) is the restricted IARPA HIATUS-program benchmark
+used for TA1/TA2 evaluation. It is only reachable on HIATUS-team machines /
+mounts. Override the roots below via environment variables if your copy
+lives elsewhere; the defaults match the UO cluster layout.
 """
 
-# HRS_DIR = '/home/hieum/uonlp/hiatus_main/HRS'
-HRS_DIR = '/gpfs/home/cuongp/hiatus-libs/HRS'
+import os
+
+HRS_DIR = os.environ.get('HRS_DATA_ROOT', '/gpfs/home/cuongp/hiatus-libs/HRS')
 PERFORMER_CONFIG_PATH = 'TA2-performer-config.yaml'
 
-HRS1_DIR = '/home/hieum/uonlp/avae/data/HRS/TA1'
+HRS1_DIR = os.environ.get('HRS1_DATA_ROOT', '/home/hieum/uonlp/avae/data/HRS/TA1')
 
 
 HRS1_PATHS = {

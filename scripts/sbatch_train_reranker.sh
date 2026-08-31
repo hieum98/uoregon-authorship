@@ -21,6 +21,10 @@
 
 set -euo pipefail
 
+# SLURM copies the batch script to a spool dir, so the repo root can't be
+# derived from $BASH_SOURCE. Submit from the repo root, or set REPO_ROOT.
+cd "${REPO_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
+
 mkdir -p logs
 
 CONFIG_DIR="${CONFIG_DIR:-configs/reranker}"

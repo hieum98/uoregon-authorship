@@ -1,21 +1,34 @@
-torch
+# Pinned to the versions installed in the `hiatus-phase3` conda env
+# (the environment this project is developed and run in).
+torch==2.6.0
 transformers==4.57.6
-peft
-bitsandbytes
-lightning
-pytorch-metric-learning
-hydra-core
-omegaconf
-bm25s
-datasets
-faiss-cpu
-scikit-learn
-scipy
-pandas
-numpy
-polars
-tqdm
-safetensors
-einops
-PyYAML
-mergekit
+peft==0.18.0
+lightning==2.5.6
+pytorch-metric-learning==2.9.0
+hydra-core==1.3.2
+omegaconf==2.3.0
+bm25s==0.3.0
+datasets==4.4.1
+faiss-cpu==1.13.2
+scikit-learn==1.8.0
+scipy==1.17.0
+pandas==3.0.0
+numpy==2.3.1
+polars==1.35.2
+tqdm==4.67.1
+safetensors==0.5.3
+einops==0.8.2
+PyYAML==6.0.3
+mergekit==0.1.4
+wandb==0.23.0
+
+# Optional: only needed if training/serving with 4-bit quantization
+# (model.quantization=true in a config). Not installed in hiatus-phase3
+# by default and not required for any of the default configs.
+# bitsandbytes
+
+# Optional, restricted access: enables hiatus-metrics-native TA1/TA2 scoring
+# in authorship/evaluation/evaluator.py. Falls back to a local implementation
+# when unavailable. Not on PyPI — install from the private HIATUS repo if you
+# are an authorized program member. See docs/EVALUATION.md.
+# hiatus

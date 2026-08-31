@@ -10,3 +10,5 @@ logs
 merged_models_checkpoints.zip
 docs/reranker_shortcut_learning.md
 data-topics/
+scripts/eval_hrs21_all_variants.sh
+scripts/eval_hrs21_reference_embedder.py
