@@ -145,6 +145,7 @@ configs/
   embedder/default.yaml        # Embedder training config
   reranker/default.yaml        # Reranker training config
   reranker/local_h100.yaml     # Single-node H100 variant
+  reranker/reranker-v13-temp-20k.yaml    # Config for the best reported checkpoint
   mergekit/model_merging.template.yaml
 
 scripts/
