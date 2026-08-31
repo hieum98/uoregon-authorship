@@ -1,0 +1,150 @@
+seed: 1337     # v11 uses a fresh seed so the 20k-query subsample is disjoint
+               # from what v10 had already trained on by step18000.
+num_workers: 16
+run_name: reranker-v13-temp-20k
+
+data:
+  dataset_names:
+    # English
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/reddit_dump_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/amazon_reviews_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/goodreads_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/hiatus-imdb_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/HNI_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/movie_reviews_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/MUD_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/nyt_comments_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/STX_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/wiki_en_small_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/yelp_review_hard
+    # Chinese
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/dianping_review_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/douban_reviews_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/jd_reviews_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/weibo_full_hard
+    # Russian
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/proza_ru_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/ru_KP_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/ru_reddit_dump_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/ru_STX_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/ru_telegram_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/stihi_ru_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/wiki_ru_hard
+    # Multilingual
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/exorde_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/u-sticker_hard
+    - /gpfs/projects/uonlp/hieum/uoregon-authorship/data-topics/yt_comments_hard
+  languages: [en, zh, ru, ar, de, es, fr]
+  # Per-device forward = (global_batch_size / devices) * pairs_per_query.
+  # pairs_per_query = num_pos + num_neg = 3 + 12 = 15 (was 6 at v9).
+  # 24/4 * 15 = 90 seqs/forward ~= v9's 64/4 * 6 = 96, so it fits the same GPU mem.
+  # grad-accum still 8 -> 24*15*8 = 2880 pairs/update ~= v9's 64*6*8 = 3072.
+  global_batch_size: 48
+  max_seq_length: 512
+  num_train_examples: 100000
+  num_pos_per_query: 3    # 1 random (easy/high-sim) + 1 med + 1 hard (most dissimilar) same-author
+  num_neg_per_query: 12   # 3-way (random + close-to-query + close-to-positive); 1:4 pos:neg
+  # Paper-style negative mix (arXiv:2510.16819), curriculum over epochs:
+  #   random  = n(r):   random different-author docs
+  #   hard_q  = n(dq):  closest different-author docs to the QUERY  (hard_negative_docIDs)
+  #   pos_med = n(dq+): closest different-author docs to the MED positive
+  #   pos_hard= n(dq+): closest different-author docs to the HARD positive
+  # n(dq+) reuses each positive doc's own hard_negative_docIDs (finetuned-embedder mined).
+  negative_curriculum:
+    - random: 8     # easy stage: mostly random + query-close
+      hard_q: 0
+      pos_med: 4
+      pos_hard: 0
+    - random: 8     # med stage: introduce negatives close to the medium positive
+      hard_q: 1
+      pos_med: 2
+      pos_hard: 1
+    - random: 8     # hard stage: negatives close to the hardest positive
+      hard_q: 2
+      pos_med: 0
+      pos_hard: 2
+  instruction: null
+
+model:
+  model_name_or_path: Qwen/Qwen3-4B
+  attn_implementation: flash_attention_2
+  quantization: false
+  lora:
+    use_lora: false
+    r: 16
+    alpha: 32
+    dropout: 0.1
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    name: default
+
+training:
+  output_dir: outputs/reranker-v13-temp-20k
+  devices: 4
+  num_nodes: 1
+  precision: bf16-mixed
+  # From-scratch v11 (no warm-start) after v11-warm diagnostic showed the v10
+  # warm-start carried the inverted-similarity prior. 3 epochs so all curriculum
+  # stages activate (stage 0 = easy, stage 1 = +hard_q, stage 2 = +pos_hard).
+  # model_resume_from: outputs/reranker-v10/checkpoint_step18000.ckpt
+  epochs: 3
+  lr: 5.0e-6
+  weight_decay: 0.1
+  warmup_steps: 500                 # ~1% of total steps for from-scratch stability
+  min_reduce_rate: 0.05
+  grad_clip: 1.0
+  label_smoothing: 0.05
+  # Loss mix tuned from v11 wandb diagnosis:
+  # - v11 at listwise=1.0 had listwise_loss ~2.5 vs BCE ~0.4 (listwise 6x larger).
+  #   Result: avg_p_yes_pos stuck <0.5 -> low recall, eval needed w=0.05 to be
+  #   net-positive because reranker logit magnitudes drowned the embedder cos.
+  # - listwise=0.2 brings BCE and listwise to gradient parity so BCE can re-anchor
+  #   absolute magnitudes, restoring the normal w=0.25-0.5 interpolation regime.
+  # - pos_weight=2.0 compensates the 1:4 pos:neg imbalance now that BCE matters
+  #   again; should lift recall from ~0.25 toward 0.5+.
+  pos_weight: 2.0
+  ranking_loss_weight: 0.0          # pairwise hinge subsumed by listwise
+  ranking_margin: 0.0
+  listwise_loss_weight: 0.2         # was 1.0; gradient parity with BCE per v11 diagnosis
+  listwise_temperature: 2.0         # unchanged; v11 data showed no logit crushing
+  gradient_accumulation_steps: 4
+  checkpoint_interval: 2000
+  checkpoint_save_optimizer: false
+  checkpoint_save_scheduler: false
+  logger:
+    type: wandb
+    project: authorship-reranker
+
+evaluation:
+  genres:
+    # - HRS2.1
+    # - HRS2.2
+    # - HRS2.3
+    # - HRS2.4
+    # - HRS2.5
+    - en_cross_genre_medium
+    # - HRS2.101
+    # - HRS2.102
+    # - HRS2.103
+    # - HRS2.104
+    # - HRS2.105
+    - ru_cross_genre_long
+    - ru_cross_genre_medium
+    - HRS3.1
+    - HRS3.2
+    - HRS3.3
+    - HRS3.4
+    - HRS3.5
+    - en_cross_genre_short
+    # - HRS3.301
+    # - HRS3.302
+    # - HRS3.303
+    # - HRS3.304
+    # - HRS3.305
+    - zh_cross_genre_medium
+    - zh_cross_genre_short
+  batch_size: 32
+  max_length: 512
+  top_k: 16
+  reranker_weight: 0.5
+  embedder_config_dir: null
+  embedder_checkpoint_path: null
